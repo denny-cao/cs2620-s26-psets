@@ -1,0 +1,24 @@
+edition = "2023";
+
+message TryRequest {
+    string serial = 1;
+    string name = 2;
+    string count = 3;
+}
+
+message TryResponse {
+    string value = 1;
+}
+
+message DoneRequest {
+}
+
+message DoneResponse {
+    bytes client_checksum = 1;
+    bytes server_checksum = 2;
+}
+
+service RPCGame {
+    rpc Try (TryRequest) returns (TryResponse) {}
+    rpc Done (DoneRequest) returns (DoneResponse) {}
+}
