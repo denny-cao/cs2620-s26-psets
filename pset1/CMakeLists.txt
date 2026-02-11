@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(rpcgame CXX)
+add_subdirectory(third_party/rpclib)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -64,6 +65,7 @@ target_link_libraries(rpcg-server PRIVATE
     protobuf::libprotobuf
     ${XXHASH_LIBRARY}
     Threads::Threads
+    rpc
 )
 
 # Client executable
@@ -83,4 +85,5 @@ target_link_libraries(rpcg-client PRIVATE
     protobuf::libprotobuf
     ${XXHASH_LIBRARY}
     Threads::Threads
+    rpc
 )

@@ -3,7 +3,7 @@
 ## Build instructions for Mac Homebrew
 
 ```
-brew install grpc cmake xxhash
+brew install rpclib cmake xxhash
 cmake -B build
 cmake --build build
 ```
