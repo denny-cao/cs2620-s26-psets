@@ -15,10 +15,10 @@ public:
     grpc::Status Try(grpc::ServerContext* context, const TryRequest* request,
                      TryResponse* response) {
         // parse request
-        std::string serialstr = request->serial();
+        const std::string& serialstr = request->serial();
         uint64_t serial = from_str_chars<uint64_t>(serialstr);
-        std::string name = request->name();
-        std::string countstr = request->count();
+        const std::string& name = request->name();
+        const std::string& countstr = request->count();
         uint64_t count = from_str_chars<uint64_t>(countstr);
 
         // process parameters
@@ -33,8 +33,8 @@ public:
     grpc::Status Done(grpc::ServerContext* context, const DoneRequest* request,
                       DoneResponse* response) {
         // calculate checksums
-        std::string client_csum = client_checksum();
-        std::string server_csum = server_checksum();
+        const std::string& client_csum = client_checksum();
+        const std::string& server_csum = server_checksum();
 
         // construct response
         response->set_client_checksum(client_csum);
@@ -58,7 +58,7 @@ void server_start(std::string address) {
 
     grpc::ServerBuilder builder;
     // Request a compressed channel
-    builder.SetDefaultCompressionAlgorithm(GRPC_COMPRESS_GZIP);
+    // builder.SetDefaultCompressionAlgorithm(GRPC_COMPRESS_GZIP);
     // Listen on the given address without any authentication
     builder.AddListeningPort(address, grpc::InsecureServerCredentials());
     // Register `service` as the instance through which we'll communicate with
