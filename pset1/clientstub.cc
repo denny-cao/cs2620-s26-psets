@@ -5,6 +5,12 @@
 #include "rpcgame.grpc.pb.h"
 #include "rpcgame.hh"
 
+static size_t WINDOW_SIZE = 20; // TODO: tune this parameter
+
+/** 
+ * AsyncCall stores all per-RPC state required by gRPC's async unary API 
+ */
+
 struct AsyncCall {
     TryRequest request;
     TryResponse response;
@@ -16,10 +22,15 @@ struct AsyncCall {
 
 class RPCGameClient {
 public:
-    RPCGameClient(std::shared_ptr<grpc::Channel> channel, size_t window_size)
-        : _stub(RPCGame::NewStub(channel)), _window_size(window_size) {
+    RPCGameClient(std::shared_ptr<grpc::Channel> channel)
+        : _stub(RPCGame::NewStub(channel)) {
     }
 
+    /**
+     * Send a Try RPC asynchronously, subject to window size.
+     * Blocks until there is space in the window.
+     * Otherwise, enqueues an RPC and returns immediately.
+     */
     void send_try(const char* name, size_t name_len, uint64_t count) {
         // if window full, process until we have space
         while (_in_flight >= _window_size) { process_one_response(); }
@@ -39,6 +50,9 @@ public:
         ++_in_flight;
     }
 
+    /**
+     * Finish protocol by draining outstanding Try RPCs and sending Done RPC, then print checksums and whether they match.
+     */
     void finish() {
         // Process remaining RPCs
         wait_for_all_pending_rpcs();
@@ -73,14 +87,16 @@ private:
     std::unique_ptr<RPCGame::Stub> _stub;                      // gRPC stub for making RPC calls
     grpc::CompletionQueue _cq;                                 // for processing responses
     uint64_t _serial = 1;                                      // serial number for next request
-    size_t _window_size = 0;                                   // allows at most _window_size requests to be in-flight at once
+    size_t _window_size = WINDOW_SIZE;                         // allows at most _window_size requests to be in-flight at once
     size_t _in_flight = 0;                                     // number of requests sent but not yet received responses for
 
     std::unordered_map<uint64_t, uint64_t> _pending_responses; // serial -> value
     uint64_t _next_response_serial = 1;                        // serial number of next response to inform client about
 
+    /**
+     * Block until one async Try RPC completes, then process results.
+     */
     void process_one_response() {
-        // Process one response from the server
         void* tag;
         bool ok;
 
@@ -127,6 +143,9 @@ private:
         --_in_flight;
     }
 
+    /**
+     * Drain outstanding Try RPCs
+     */
     void wait_for_all_pending_rpcs() {
         // Wait until all in-flight requests have received responses
         while (_in_flight > 0) { process_one_response(); }
@@ -140,8 +159,7 @@ void client_connect(std::string address) {
     grpc::ChannelArguments args;
     args.SetCompressionAlgorithm(GRPC_COMPRESS_GZIP);
     client = std::make_unique<RPCGameClient>(
-        grpc::CreateCustomChannel(address, grpc::InsecureChannelCredentials(), args),
-        20 // window size TODO: tune this parameter
+        grpc::CreateCustomChannel(address, grpc::InsecureChannelCredentials(), args)
     );
 }
 
