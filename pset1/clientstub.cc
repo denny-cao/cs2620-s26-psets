@@ -7,11 +7,16 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "rpcgame.hh"
 
-static size_t WINDOW_SIZE = 512; // TODO: tune this parameter
+// TODO: tune parameters
+static size_t WINDOW_SIZE = 4096;
+static size_t BATCH_SIZE = 2048;
 
 class RPCGameClient {
 public:
@@ -23,18 +28,21 @@ public:
 
     void send_try(const char* name, size_t name_len, uint64_t count) {
         // if window full, process until we have space
-        while (_in_flight >= _window_size) { process_one_response(); }
+        while (_in_flight_tries >= WINDOW_SIZE) { process_one_batch_response(); }
 
-        const uint64_t serial = _serial;
-        auto fut = _client.async_call("try", serial, std::string(name, name_len), count);
-        _pending_calls.emplace(serial, std::move(fut));
+        _batch_buf.emplace_back(_serial, std::string(name, name_len), count);
+
+        // send batch once full
+        if (_batch_buf.size() >= BATCH_SIZE) { flush_batch(); }
         ++_serial;
-        ++_in_flight;
     }
 
     void finish() {
-        // Drain outstanding Try RPCs (delivering in order)
-        wait_for_all_pending_rpcs();
+        // flush remaining tries in buffer
+        if (!_batch_buf.empty()) { flush_batch(); }
+
+        // drain outstanding batches 
+        while (_in_flight_batches > 0) { process_one_batch_response(); }
 
         // Call done() and retrieve checksums from server
         auto tup = _client.call("done").as<std::tuple<std::string, std::string>>();
@@ -54,70 +62,121 @@ public:
     }
 
 private:
+    using TryItem = std::tuple<uint64_t, std::string, uint64_t>; // (serial, name, count)
+
+    struct Batch {
+        std::vector<uint64_t> serials; // serials of tries in this batch (for response processing)
+        size_t n = 0;                  // number of tries in batch
+    };
+
     rpc::client _client;
 
     uint64_t _serial = 1;
-    size_t _window_size = WINDOW_SIZE;
-    size_t _in_flight = 0;
 
-    std::unordered_map<uint64_t, std::future<clmdep_msgpack::object_handle>> _pending_calls;
+    std::vector<TryItem> _batch_buf;   // buffer of tries waiting to be sent in a batch
 
-    // buffer out-of-order completions so we can deliver in serial order
-    std::unordered_map<uint64_t, uint64_t> _pending_responses;
+    uint64_t _next_batch_id = 1;   // id of next batch to be sent
+    std::unordered_map<uint64_t, std::future<clmdep_msgpack::object_handle>> _batch_futures;
+    std::unordered_map<uint64_t, Batch> _batches; // batch metadata for in-flight batches
+
+    // Delivery ordering
+    std::unordered_map<uint64_t, uint64_t> _pending_responses; // serial -> value
     uint64_t _next_response_serial = 1;
 
-    void process_one_response() {
-        if (_pending_calls.empty()) return;
+    // Counts for windowing
+    size_t _in_flight_batches = 0;
+    size_t _in_flight_tries = 0; // total tries represented by all in-flight batches
 
-        // complete the next expected serial if present
-        auto it = _pending_calls.find(_next_response_serial);
+    void flush_batch() {
+        if (_batch_buf.empty()) return;
 
-        // else try to find any ready future to avoid blocking on a slow one
-        if (it == _pending_calls.end()) {
-            for (auto jt = _pending_calls.begin(); jt != _pending_calls.end(); ++jt) {
-                if (jt->second.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-                    it = jt;
+        // Build meta (serial list) so we can map response vector back to serials
+        Batch meta;
+        meta.n = _batch_buf.size();
+        meta.serials.reserve(meta.n);
+        for (const auto& item : _batch_buf) {
+            meta.serials.push_back(std::get<0>(item));
+        }
+
+        const uint64_t batch_id = _next_batch_id++;
+
+        // Fire async batch RPC
+        auto fut = _client.async_call("try_batch", _batch_buf);
+
+        _batch_futures.emplace(batch_id, std::move(fut));
+        _batches.emplace(batch_id, std::move(meta));
+
+        _in_flight_batches += 1;
+        _in_flight_tries += _batch_buf.size();
+
+        _batch_buf.clear();
+    }
+
+    void process_one_batch_response() {
+        if (_batch_futures.empty()) { return; }
+
+        // Prefer to wait on a batch that might enable in-order delivery.
+        // (Heuristic: batch containing _next_response_serial)
+        uint64_t chosen_id = 0;
+        for (const auto& [bid, meta] : _batches) {
+            // meta.serials is sorted increasing because serials increase monotonically
+            if (!meta.serials.empty() &&
+                meta.serials.front() <= _next_response_serial &&
+                _next_response_serial <= meta.serials.back()) {
+                chosen_id = bid;
+                break;
+            }
+        }
+
+        // Otherwise: pick any ready batch
+        if (chosen_id == 0) {
+            for (const auto& [bid, fut] : _batch_futures) {
+                if (fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                    chosen_id = bid;
                     break;
                 }
             }
         }
 
-        // if none ready, block on some in-flight call (arbitrary)
-        if (it == _pending_calls.end()) {
-            it = _pending_calls.begin();
+        // Otherwise: block on some batch
+        if (chosen_id == 0) {
+            chosen_id = _batch_futures.begin()->first;
         }
 
-        const uint64_t serial = it->first;
-        std::future<clmdep_msgpack::object_handle>& fut = it->second;
+        auto fit = _batch_futures.find(chosen_id);
+        auto mit = _batches.find(chosen_id);
 
-        // wait for completion and decode uint64_t from msgpack object
-        clmdep_msgpack::object_handle oh = fut.get();
-        uint64_t value = oh.get().as<uint64_t>();
+        // Get returned vector<uint64_t>
+        clmdep_msgpack::object_handle resp = fit->second.get();
+        std::vector<uint64_t> values = resp.as<std::vector<uint64_t>>();
 
-        // remove from in-flight tracking
-        _pending_calls.erase(it);
-        --_in_flight;
-
-        // Deliver in serial order to preserve checksum semantics
-        if (serial == _next_response_serial) {
-            client_recv_try_response(value);
-            ++_next_response_serial;
-        } else {
-            _pending_responses.emplace(serial, value);
+        Batch& meta = mit->second;
+        if (values.size() != meta.n) {
+            std::cerr << "try_batch returned wrong size: expected " << meta.n
+                      << " got " << values.size() << "\n";
+            std::exit(1);
         }
 
-        // Drain any buffered responses that are now deliverable
+        // Insert responses into pending map keyed by serial.
+        for (size_t i = 0; i < meta.n; ++i) {
+            _pending_responses.emplace(meta.serials[i], values[i]);
+        }
+
+        // Remove this batch from tracking
+        _in_flight_batches -= 1;
+        _in_flight_tries -= meta.n;
+
+        _batch_futures.erase(fit);
+        _batches.erase(mit);
+
+        // Deliver in serial order
         while (true) {
-            auto jt = _pending_responses.find(_next_response_serial);
-            if (jt == _pending_responses.end()) break;
-            client_recv_try_response(jt->second);
-            _pending_responses.erase(jt);
+            auto it = _pending_responses.find(_next_response_serial);
+            if (it == _pending_responses.end()) break;
+            client_recv_try_response(it->second);
+            _pending_responses.erase(it);
             ++_next_response_serial;
         }
-    }
-
-    void wait_for_all_pending_rpcs() {
-        while (_in_flight > 0) { process_one_response(); }
     }
 };
 
