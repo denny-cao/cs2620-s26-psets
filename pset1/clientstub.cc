@@ -10,7 +10,6 @@ static size_t WINDOW_SIZE = 20; // TODO: tune this parameter
 /** 
  * AsyncCall stores all per-RPC state required by gRPC's async unary API 
  */
-
 struct AsyncCall {
     TryRequest request;
     TryResponse response;
@@ -70,7 +69,7 @@ public:
         }
 
         // parse response
-        std::string my_client_checksum = client_checksum(),
+        const std::string& my_client_checksum = client_checksum(),
             my_server_checksum = server_checksum();
         bool ok = my_client_checksum == response.client_checksum()
             && my_server_checksum == response.server_checksum();
@@ -120,7 +119,7 @@ private:
         }
 
         // parse response. serial and val
-        std::string valuestr = call->response.value();
+        const std::string& valuestr = call->response.value();
         uint64_t value = from_str_chars<uint64_t>(valuestr);
 
         // if response is for next expected serial, inform client immediately
@@ -157,7 +156,7 @@ static std::unique_ptr<RPCGameClient> client;
 void client_connect(std::string address) {
     // Request a compressed channel
     grpc::ChannelArguments args;
-    args.SetCompressionAlgorithm(GRPC_COMPRESS_GZIP);
+    // args.SetCompressionAlgorithm(GRPC_COMPRESS_GZIP);
     client = std::make_unique<RPCGameClient>(
         grpc::CreateCustomChannel(address, grpc::InsecureChannelCredentials(), args)
     );
