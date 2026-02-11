@@ -169,4 +169,3 @@ void client_send_try(const char* name, size_t name_len, uint64_t count) {
 void client_finish() {
     client->finish();
 }
-

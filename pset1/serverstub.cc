@@ -33,8 +33,8 @@ public:
     grpc::Status Done(grpc::ServerContext* context, const DoneRequest* request,
                       DoneResponse* response) {
         // calculate checksums
-        std::string client_csum = client_checksum();
-        std::string server_csum = server_checksum();
+        const std::string& client_csum = client_checksum();
+        const std::string& server_csum = server_checksum();
 
         // construct response
         response->set_client_checksum(client_csum);
