@@ -48,7 +48,7 @@ int main() {
 
 A task begins running as soon as it is called, and keeps running until it hits a
 `co_await`. Then it suspends and other tasks get a chance to run. When its
-awaited event or task becomes ready, the task resumes where it left off.
+awaited event or task becomes ready, it resumes where it left off.
 
 The `main` function starts `main_task`, which starts `slow_add`. Both
 `slow_add` and `main_task` then suspend themselves, `slow_add` waiting on a

@@ -1,4 +1,8 @@
 #pragma once
+#include "detail/circular_int.hh"
+
+namespace cotamer {
+namespace detail {
 
 template <int arity = 4>
 struct driver_timers {
@@ -187,4 +191,7 @@ void driver_timers<arity>::hard_cull(unsigned pos) {
             pos = p;
         } while (pos && ts_[pos] < ts_[heap_parent(pos)]);
     }
+}
+
+}
 }
