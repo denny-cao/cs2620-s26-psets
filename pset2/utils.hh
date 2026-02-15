@@ -3,6 +3,7 @@
 #include <random>
 #include <string>
 #include <system_error>
+#include <getopt.h>
 
 // - perform std::from_chars on `s`; all of `s` must be parsed
 template <typename T>
@@ -39,8 +40,6 @@ inline RNG randomly_seeded() {
     return RNG(seq);
 }
 
-// - flip a coin
-template <typename RNG>
-inline bool coin_flip(RNG& rng) {
-    return std::uniform_int_distribution<int>(0, 1)(rng);
-}
+
+// - compute a `short_options` string corresponding to `longopts`
+std::string short_options_for(const struct option* longopts);

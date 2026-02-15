@@ -32,6 +32,8 @@ struct server {
         : id_(id), N_(N), net_(net), my_port_(net.input(id_)), color_(color) {
     }
 
+    void set_stubborn(bool stubborn) { stubborn_ = stubborn; }
+
     cot::task<> consensus();
 
 private:
@@ -48,6 +50,12 @@ private:
 
     // set when we decide
     bool decided_ = false;
+
+    /* STUBBORN */
+    // A stubborn server refuses to acknowledge or decide a color
+    // other than its own.
+    bool stubborn_ = false;
+    /* END STUBBORN */
 
 
     cot::event failure_detector(int leader);
@@ -73,6 +81,12 @@ cot::task<message> server::receive(message_type mt) {
 
         // DECIDE messages cause us to decide
         if (m.type == m_decide) {
+            /* STUBBORN */
+            if (stubborn_ && m.color != color_) {
+                continue;
+            }
+            /* END STUBBORN */
+
             color_ = m.color;
             decided_ = true;
             break;
@@ -112,6 +126,13 @@ cot::task<> server::consensus() {
             while (received_prepare <= N_ / 2) {
                 auto m = co_await receive(m_prepare);
                 ++received_prepare;
+
+                /* STUBBORN */
+                if (stubborn_ && m.color != color_) {
+                    continue;
+                }
+                /* END STUBBORN */
+
                 // maybe update color
                 if (m.color_round > color_round_) {
                     color_ = m.color;
@@ -138,6 +159,15 @@ cot::task<> server::consensus() {
         std::optional<message> maybe_propose =
             co_await cot::attempt(receive(m_propose),
                                   failure_detector(leader));
+
+        /* STUBBORN */
+        if (stubborn_
+            && maybe_propose
+            && maybe_propose->color != color_) {
+            maybe_propose = std::nullopt;
+        }
+        /* END STUBBORN */
+
         if (decided_) {
             break;
         } else if (maybe_propose) {
@@ -285,6 +315,14 @@ static bool try_one_seed(ctconsensus::network_type& net,
             required_consensus = "";
         }
         servers.emplace_back(i, N, net, color);
+
+        /* STUBBORN */
+        // Each server is stubborn with probability 0.001
+        if (net.coin_flip(0.001)) {
+            servers.back().set_stubborn(true);
+        }
+        /* END STUBBORN */
+
         servers.back().consensus().detach();
     }
 

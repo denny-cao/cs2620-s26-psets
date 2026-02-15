@@ -29,6 +29,7 @@ public:
     inline ~event_handle();
 
     explicit operator bool() const { return eb_ != nullptr; }
+    inline bool empty() const noexcept;
     event_body* get() const { return eb_; }
     event_body& operator*() const { return *eb_; }
     event_body* operator->() const { return eb_; }

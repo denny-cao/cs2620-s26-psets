@@ -10,16 +10,11 @@
 #include <utility>
 #include <variant>
 #include <vector>
+#include "detail/timer_heap.hh"
 #include "detail/event_handle.hh"
 
 // cotamer.hh
 //    Public interface to the Cotamer coroutine library.
-
-namespace cotamer {
-using clock = std::chrono::system_clock;
-}
-
-#include "detail/cotamer_timers.hh"
 
 namespace cotamer {
 
@@ -41,9 +36,9 @@ public:
     event& operator=(event&&) = default;
 
     inline void trigger();
-    inline bool triggered() const;
+    inline bool triggered() const noexcept;
 
-    inline bool empty() const;
+    inline bool empty() const noexcept;
 
     inline const detail::event_handle& handle() const&;
     inline detail::event_handle&& handle() &&;
@@ -87,7 +82,7 @@ public:
     detail::task_awaiter<T> operator co_await() const noexcept;
 
 private:
-    friend class detail::task_promise<T>;
+    friend struct detail::task_promise<T>;
     handle_type handle_;
 };
 
@@ -122,6 +117,7 @@ task<std::optional<bool>> attempt(task<void> t, Es&&... es);
 
 
 // Time and scheduling functions (operate on driver::main).
+using clock = std::chrono::system_clock;
 inline clock::time_point now();
 inline void step_time();
 
@@ -164,17 +160,16 @@ public:
 
     void loop();
     void clear();
-    bool clearing() const { return clearing_; }
 
     static std::unique_ptr<driver> main;
+    static bool clearing;
 
 private:
-    friend class detail::event_body;
+    friend struct detail::event_body;
 
-    bool clearing_ = false;
     std::deque<std::coroutine_handle<>> ready_;
     std::deque<event> asap_;
-    detail::driver_timers<> timed_;
+    timer_heap<detail::event_handle> timed_;
     clock::time_point now_;
 };
 

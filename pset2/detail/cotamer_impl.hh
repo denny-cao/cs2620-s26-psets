@@ -213,12 +213,12 @@ struct event_body {
 
     // There are no listeners, but the event has not triggered yet.
     // (Maybe listeners will be added later.)
-    bool empty() const {
+    bool empty() const noexcept {
         return listeners_.empty();
     }
 
     // The event has triggered.
-    bool triggered() const {
+    bool triggered() const noexcept {
         return listeners_.empty_capacity();
         // In its initial state, listeners_ has nonzero capacity; we set its
         // capacity to 0 only in triggered().
@@ -423,6 +423,11 @@ inline void event_handle::swap(event_handle& x) noexcept {
     x.eb_ = tmp;
 }
 
+inline bool event_handle::empty() const noexcept {
+    return !eb_ || eb_->empty();
+}
+
+
 
 // task_event_awaiter<T>
 //    Awaiter for `co_await event` inside a task.
@@ -463,7 +468,7 @@ struct task_event_awaiter {
         // events. We destroy the whole chain by forcing the event-unblocked
         // coroutines to throw an exception; that exception is propagated
         // through their awaiters.
-        if (driver::main->clearing()) {
+        if (driver::clearing) {
             throw clearing_error{};
         }
     }
@@ -471,11 +476,11 @@ struct task_event_awaiter {
 
 template <typename T>
 inline task_event_awaiter<T> task_promise<T>::await_transform(event ev) {
-    return task_event_awaiter<T>{std::move(ev).handle()};
+    return task_event_awaiter<T>{std::move(ev).handle(), 0};
 }
 
 inline task_event_awaiter<void> task_promise<void>::await_transform(event ev) {
-    return task_event_awaiter<void>{std::move(ev).handle()};
+    return task_event_awaiter<void>{std::move(ev).handle(), 0};
 }
 
 
@@ -500,11 +505,11 @@ inline event_handle& task_promise<void>::make_interest() {
 
 template <typename T>
 inline task_event_awaiter<T> task_promise<T>::await_transform(interest) {
-    return task_event_awaiter<T>(make_interest());
+    return task_event_awaiter<T>{make_interest(), 0};
 }
 
 inline task_event_awaiter<void> task_promise<void>::await_transform(interest) {
-    return task_event_awaiter<void>(make_interest());
+    return task_event_awaiter<void>{make_interest(), 0};
 }
 
 // make_event(interest)
@@ -587,11 +592,11 @@ inline event::event(detail::event_handle ev)
 inline event::event(std::nullptr_t) {
 }
 
-inline bool event::empty() const {
+inline bool event::empty() const noexcept {
     return !ep_ || ep_->empty();
 }
 
-inline bool event::triggered() const {
+inline bool event::triggered() const noexcept {
     return !ep_ || ep_->triggered();
 }
 

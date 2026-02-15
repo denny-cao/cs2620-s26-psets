@@ -4,17 +4,21 @@
 namespace cotamer {
 
 std::unique_ptr<driver> driver::main{new driver};
+bool driver::clearing = false;
 
 driver::driver()
     : now_(std::chrono::system_clock::from_time_t(1634070069)) {
 }
 
 driver::~driver() {
-    clearing_ = true;
-    while (!ready_.empty()) {
-        auto ch = ready_.front();
-        ready_.pop_front();
-        ch();
+    if (!asap_.empty() || !ready_.empty() || !timed_.empty()) {
+        // Clear any remaining events and coroutines
+        std::unique_ptr<driver> tmp(this);
+        tmp.swap(main);
+        clear();
+        loop();
+        tmp.swap(main);
+        tmp.release();
     }
 }
 
@@ -33,9 +37,7 @@ void driver::loop() {
             auto ch = ready_.front();
             ready_.pop_front();
             ch();
-            if (!clearing_) {
-                now_ += clock::duration{1};
-            }
+            now_ += clock::duration{1};
             again = true;
         }
 
@@ -46,20 +48,16 @@ void driver::loop() {
         }
 
         while (!timed_.empty() && timed_.top_time() <= now_) {
-            timed_.pop_trigger();
+            timed_.top()->trigger();
+            timed_.pop();
             again = true;
         }
     }
-    clearing_ = false;
+    clearing = false;
 }
 
 void driver::clear() {
-    clearing_ = true;
-    while (!asap_.empty()) {
-        asap_.front().trigger();
-        asap_.pop_front();
-    }
-    timed_.clear();
+    clearing = true;
 }
 
 void reset() {

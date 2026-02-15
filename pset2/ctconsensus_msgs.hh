@@ -2,19 +2,22 @@
 
 namespace ctconsensus {
 
-// - Types of message in the consensus protocol
+// ctconsensus_msgs.hh
+//    Message structures and constants for messages in the Chandra-Toueg
+//    consensus protocol.
+
+// - Types of message
 enum message_type {
     m_prepare, m_propose, m_ack, m_decide
 };
 
-// - Structure of messages in our consensus protocol
-//   (not all message types use all fields)
+// - Message structure (not all message types use all fields)
 struct message {
     message_type type;
     uint64_t round;         // all but `m_decide`
     std::string color;      // all but `m_ack`
     uint64_t color_round;   // only `m_prepare`
-    bool ack;               // only `m_acknowledge`
+    bool ack;               // only `m_ack`
 };
 
 // - Helper functions to make messages of specific types
@@ -65,11 +68,16 @@ struct formatter<message, CharT> {
     template <typename FormatContext>
     auto format(const message& m, FormatContext& ctx) const {
         switch (m.type) {
-        case m_prepare:     return std::format_to(ctx.out(), "{}({}, {}, {})", m.type, m.round, m.color, m.color_round);
-        case m_propose:     return std::format_to(ctx.out(), "{}({}, {})", m.type, m.round, m.color);
-        case m_ack:         return std::format_to(ctx.out(), "{}({}, {})", m.type, m.round, m.ack);
-        case m_decide:      return std::format_to(ctx.out(), "{}({})", m.type, m.color);
-        default:            return std::format_to(ctx.out(), "#{}({}, {}, {}, {})", int(m.type), m.round, m.color, m.color_round, m.ack);
+        case m_prepare:
+            return std::format_to(ctx.out(), "{}({}, {}, {})", m.type, m.round, m.color, m.color_round);
+        case m_propose:
+            return std::format_to(ctx.out(), "{}({}, {})", m.type, m.round, m.color);
+        case m_ack:
+            return std::format_to(ctx.out(), "{}({}, {})", m.type, m.round, m.ack);
+        case m_decide:
+            return std::format_to(ctx.out(), "{}({})", m.type, m.color);
+        default:
+            return std::format_to(ctx.out(), "#{}({}, {}, {}, {})", int(m.type), m.round, m.color, m.color_round, m.ack);
         }
     }
 };

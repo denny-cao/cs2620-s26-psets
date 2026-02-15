@@ -1,4 +1,4 @@
-# CS 2620 Spring 2026 Problem Set 2: Distributed System Simulation
+# CS 2620 Spring 2026 Problem Set 2: Breaking simulated consensus
 
 ## Build instructions
 
