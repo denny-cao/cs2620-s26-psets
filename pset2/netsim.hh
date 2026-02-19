@@ -57,6 +57,8 @@ private:
     id_type from_;
     port<T>& to_port_;
     bool verbose_;
+    network<T>& net_;
+
     cot::clock::duration link_delay_ = 20ms; // time for message to arrive
     cot::clock::duration send_delay_ = 1ms;  // time before sender can continue
 
@@ -101,6 +103,8 @@ private:
 
     id_type id_;
     bool verbose_;
+    network<T>& net_;
+
     std::deque<message_type> messageq_;
     cot::event receiver_event_;
 };
@@ -251,12 +255,12 @@ private:
 
 template <typename T>
 inline channel<T>::channel(id_type from, id_type to, network<T>& net)
-    : from_(from), to_port_(net.input(to)), verbose_(net.verbose()) {
+    : from_(from), to_port_(net.input(to)), verbose_(net.verbose()), net_(net) {
 }
 
 template <typename T>
 inline port<T>::port(id_type id, network<T>& net)
-    : id_(id), verbose_(net.verbose()) {
+    : id_(id), verbose_(net.verbose()), net_(net) {
 }
 
 // network<T>::link(from, to)
