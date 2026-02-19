@@ -46,11 +46,19 @@ private:
     uint64_t round_ = 1;
     uint64_t color_round_ = 0;
 
+    // message stash (messages from current or future round
+    // to be delivered later)
+    std::deque<message> stash_;
+
     // set when we decide
     bool decided_ = false;
 
-
     cot::event failure_detector(int leader);
+    inline message pop_stash() {
+        auto m = stash_.front();
+        stash_.pop_front();
+        return m;
+    }
     cot::task<message> receive(message_type mt);
 };
 
@@ -68,8 +76,9 @@ cot::event server::failure_detector(int leader) {
 // Ignore other messages, except for DECIDE messages.
 
 cot::task<message> server::receive(message_type mt) {
+    std::deque<message> next_stash;
     while (!decided_) {
-        auto m = co_await my_port_.receive();
+        auto m = stash_.empty() ? co_await my_port_.receive() : pop_stash();
 
         // DECIDE messages cause us to decide
         if (m.type == m_decide) {
@@ -80,10 +89,14 @@ cot::task<message> server::receive(message_type mt) {
 
         // ignore other unwanted messages
         if (m.type != mt || m.round != round_) {
+            if (m.round >= round_) {
+                next_stash.push_back(m);
+            }
             continue;
         }
 
         // return wanted message
+        stash_.append_range(next_stash);
         co_return m;
     }
 
@@ -175,14 +188,14 @@ cot::task<> server::consensus() {
 
     // We have decided!
     auto decide = decide_message(color_);
+    // send DECIDE to Nancy
+    co_await net_.link(id_, nancy_id).send(decide);
     // send DECIDE to everyone else
     for (int j = 0; j != N_; ++j) {
         if (j != id_) {
             co_await net_.link(id_, j).send(decide);
         }
     }
-    // send DECIDE to Nancy
-    co_await net_.link(id_, nancy_id).send(decide);
 }
 
 
