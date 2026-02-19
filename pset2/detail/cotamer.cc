@@ -64,4 +64,10 @@ void reset() {
     driver::main.reset(new driver);
 }
 
+
+std::string event::debug_info() const {
+    return std::format("#<event {}{}>", static_cast<void*>(handle().get()),
+                       triggered() ? " triggered" : "");
+}
+
 }

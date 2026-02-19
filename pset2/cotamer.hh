@@ -39,9 +39,11 @@ public:
     inline bool triggered() const noexcept;
 
     inline bool empty() const noexcept;
+    inline bool idle() const noexcept;
 
     inline const detail::event_handle& handle() const&;
     inline detail::event_handle&& handle() &&;
+    std::string debug_info() const;
 
 private:
     detail::event_handle ep_;
@@ -160,6 +162,9 @@ public:
 
     void loop();
     void clear();
+
+    // introspection
+    inline size_t timer_size() const;
 
     static std::unique_ptr<driver> main;
     static bool clearing;

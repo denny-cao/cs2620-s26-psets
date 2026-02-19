@@ -206,14 +206,20 @@ struct event_body {
     event_body& operator=(const event_body&) = delete;
     event_body& operator=(event_body&&) = delete;
     ~event_body() {
-        if (!listeners_.empty()) {
+        if (!idle()) {
             trigger();
         }
     }
 
-    // There are no listeners, but the event has not triggered yet.
-    // (Maybe listeners will be added later.)
+    // This event can be garbage collected: it has triggered, or it has no
+    // listeners and no other references.
     bool empty() const noexcept {
+        return listeners_.empty_capacity()
+            || (listeners_.empty() && refcount_.load(std::memory_order_relaxed) == 1);
+    }
+
+    // This event has no listeners.
+    bool idle() const noexcept {
         return listeners_.empty();
     }
 
@@ -596,13 +602,17 @@ inline bool event::empty() const noexcept {
     return !ep_ || ep_->empty();
 }
 
+inline bool event::idle() const noexcept {
+    return !ep_ || ep_->idle();
+}
+
 inline bool event::triggered() const noexcept {
     return !ep_ || ep_->triggered();
 }
 
 inline void event::trigger() {
     if (ep_) {
-        ep_->trigger();
+        std::exchange(ep_, nullptr)->trigger();
     }
 }
 
@@ -851,6 +861,10 @@ inline void loop() {
 
 inline void clear() {
     driver::main->clear();
+}
+
+inline size_t driver::timer_size() const {
+    return timed_.size();
 }
 
 }

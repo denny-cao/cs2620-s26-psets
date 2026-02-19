@@ -24,6 +24,7 @@ struct timer_heap {
     using time_point_type = typename traits_type::time_point_type;
     using value_type = T;
     using reference = T&;
+    using size_type = unsigned;
     static_assert(arity >= 2);
 
     timer_heap() = default;
@@ -34,6 +35,7 @@ struct timer_heap {
     inline ~timer_heap();
 
     inline bool empty() const;
+    inline unsigned size() const;
     inline time_point_type top_time() const;
     inline T& top() &;
     inline const T& top() const&;
@@ -75,6 +77,11 @@ inline timer_heap<T>::~timer_heap() {
 template <typename T>
 inline bool timer_heap<T>::empty() const {
     return size_ == 0;
+}
+
+template <typename T>
+inline unsigned timer_heap<T>::size() const {
+    return size_;
 }
 
 template <typename T>
