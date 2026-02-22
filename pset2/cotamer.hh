@@ -171,6 +171,7 @@ public:
 
 private:
     friend struct detail::event_body;
+    template <typename T> friend struct detail::task_event_awaiter;
 
     std::deque<std::coroutine_handle<>> ready_;
     std::deque<event> asap_;

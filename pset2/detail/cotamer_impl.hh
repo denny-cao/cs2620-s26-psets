@@ -239,16 +239,19 @@ struct event_body {
         listeners_.push_back(listener);
     }
 
-    void remove_listener(uintptr_t listener) {
+    bool remove_listener(uintptr_t listener) {
         // Remove a listener (which might have been added multiple times).
+        bool found = false;
         for (auto it = listeners_.begin(); it != listeners_.end(); ) {
             if (*it == listener) {
                 *it = listeners_.back();
                 listeners_.pop_back();
+                found = true;
             } else {
                 ++it;
             }
         }
+        return found;
     }
 
     inline void trigger();
@@ -444,8 +447,13 @@ struct task_event_awaiter {
     uintptr_t coroutine_;
 
     ~task_event_awaiter() {
-        if (coroutine_) {
-            eh_->remove_listener(coroutine_);
+        if (coroutine_ && !eh_->remove_listener(coroutine_)) {
+            // Our containing coroutine is being destroyed while suspended, but
+            // `eh_` has already triggered and scheduled our coroutine_handle on
+            // the driver's ready queue. Avoid use-after-free by removing the
+            // coroutine from the driver's queue.
+            auto coh = std::coroutine_handle<>::from_address(reinterpret_cast<void*>(coroutine_));
+            std::erase(driver::main->ready_, coh);
         }
     }
     bool await_ready() noexcept {
