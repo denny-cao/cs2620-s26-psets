@@ -112,7 +112,8 @@ private:
 
     std::deque<message_type> messageq_;
     cot::event receiver_event_;
-    cot::clock::duration recv_delay_ = 100us; // computation delay on receive
+
+    cot::clock::duration recv_delay_ = 1ms;  // time to process a received message
 };
 
 
