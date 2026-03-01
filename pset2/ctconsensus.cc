@@ -26,6 +26,7 @@ constexpr int nancy_id = -1;
 // bug flags (set via command-line options)
 bool weakfd = false;
 bool dropdecide = false;
+bool skipround = false;
 
 
 // server
@@ -85,7 +86,7 @@ cot::event server::failure_detector(int leader) {
     (void) leader;
     // BUG (weakfd): 10% false positive rate
     if (weakfd) { return cot::after(66ms); }
-    return cot::after(1500ms);
+    return cot::after(100ms);
 }
 
 
@@ -180,7 +181,13 @@ cot::task<> server::consensus() {
             break;
         } else if (maybe_propose) {
             color_ = maybe_propose->color;
-            color_round_ = round_;
+            // skipround BUG: skip updating color_round_ on PROPOSE.
+            // Without this, servers report stale color_round_ in future
+            // PREPAREs, letting a new leader override a locked color
+            // => two servers decide different colors (safety violation).
+            if (!skipround) {
+                color_round_ = round_;
+            }
         }
         co_await net_.link(id_, leader).send(
             ack_message(round_, (bool) maybe_propose)
@@ -378,6 +385,7 @@ static struct option options[] = {
     { "quiet", no_argument, nullptr, 'q' },
     { "weakfd", no_argument, nullptr, 'w' },
     { "dropdecide", no_argument, nullptr, 'd' },
+    { "skipround", no_argument, nullptr, 's' },
     { nullptr, 0, nullptr, 0 }
 };
 
@@ -414,6 +422,8 @@ int main(int argc, char* argv[]) {
             ctconsensus::weakfd = true;
         } else if (ch == 'd') {
             ctconsensus::dropdecide = true;
+        } else if (ch == 's') {
+            ctconsensus::skipround = true;
         } else {
             std::print(std::cerr, "Unknown option\n");
             return 1;
