@@ -5,7 +5,6 @@
 #include <list>
 #include <numeric>
 #include <print>
-#include <set>
 #include <getopt.h>
 
 namespace cot = cotamer;
@@ -60,8 +59,8 @@ private:
     // set when we decide
     bool decided_ = false;
 
-    // track servers we've suspected via FD
-    std::set<int> suspected_;
+    // dropdecide: track how we decided
+    bool decided_as_leader_ = false;
 
     cot::event failure_detector(int leader);
     inline message pop_stash() {
@@ -182,9 +181,6 @@ cot::task<> server::consensus() {
         } else if (maybe_propose) {
             color_ = maybe_propose->color;
             color_round_ = round_;
-        } else if (dropdecide) {
-            // FD fired => record this leader as suspected
-            suspected_.insert(leader);
         }
         co_await net_.link(id_, leader).send(
             ack_message(round_, (bool) maybe_propose)
@@ -205,6 +201,7 @@ cot::task<> server::consensus() {
             } else if (success > N_ / 2) {
                 // A majority acknowledged our color! Time to decide.
                 decided_ = true;
+                decided_as_leader_ = true;
                 break;
             }
         }
@@ -217,15 +214,26 @@ cot::task<> server::consensus() {
 
     // We have decided!
     auto decide = decide_message(color_);
-    // send DECIDE to Nancy
+    // send DECIDE to Nancy (always delivered)
     co_await net_.link(id_, nancy_id).send(decide);
-    // send DECIDE to everyone else
-    // BUG (dropdecide): skip retransmission to servers we previously
-    // suspected. If they were merely slow (not crashed), they'll
-    // never learn the decision and get stuck.
-    for (int j = 0; j != N_; ++j) {
-        if (j != id_ && !(dropdecide && suspected_.count(j))) {
-            co_await net_.link(id_, j).send(decide);
+    // dropdecide BUG: Only the leader who decided sends DECIDE to
+    // a random subset of servers (sim crash mid-broadcast).
+    // Servers that learned via receiving DECIDE skip rebroadcast
+    if (dropdecide) {
+        if (decided_as_leader_) {
+            // Leader "crashes" mid-broadcast: only tell ~half the servers
+            for (int j = 0; j != N_; ++j) {
+                if (j != id_ && net_.coin_flip()) {
+                    co_await net_.link(id_, j).send(decide);
+                }
+            }
+        }
+        // else: decided via receive: don't rebroadcast at all
+    } else {
+        for (int j = 0; j != N_; ++j) {
+            if (j != id_) {
+                co_await net_.link(id_, j).send(decide);
+            }
         }
     }
 }

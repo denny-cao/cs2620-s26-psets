@@ -65,7 +65,7 @@ private:
     bool failed_ = false;
 
     cot::clock::duration link_delay_ = 20ms; // time for message to arrive
-    cot::clock::duration send_delay_ = 1ms;  // time before sender can continue
+    cot::clock::duration send_delay_ = 10ms;  // time before sender can continue
 
     cot::task<> send_after(cot::clock::duration, message_type);
 };
@@ -113,7 +113,7 @@ private:
     std::deque<message_type> messageq_;
     cot::event receiver_event_;
 
-    cot::clock::duration recv_delay_ = 1ms;  // time to process a received message
+    cot::clock::duration recv_delay_ = 100us;  // time to process a received message
 };
 
 
@@ -127,21 +127,24 @@ template <typename T>
 cot::task<> channel<T>::send(message_type m) {
     if (failed_) {
         // silently drop the message and return after delay (time taken to detect fail)
+        if (verbose_) {
+            std::print("{}: {} → {} FAILED to send \"{}\"\n", cot::now(), source(),
+                       destination(), message_traits_type::print_transform(m));
+        }
         co_await cot::after(send_delay_);
         co_return;
     }
-
-    if (verbose_) {
+    else if (verbose_) {
         std::print("{}: {} → {} \"{}\"\n", cot::now(), source(), destination(),
                    message_traits_type::print_transform(m));
     }
 
     // jitter: base link delay + expo rv component
     auto jitter = net_.exponential(link_delay_);
+//    // jitter: base link delay + normal rv component
+//    auto jitter = net_.normal(1000ms, 200ms);   
+    if (jitter < 0ms) { jitter = 0ms; }
     auto total_delay = link_delay_ + jitter;
-
-    // clamp to 60s to avoid simulating indefinite delay
-    total_delay = std::min(total_delay, cot::clock::duration(60s));
 
     // after randomized delay, place the message in the receiver's queue
     send_after(total_delay, std::move(m)).detach();
