@@ -70,12 +70,17 @@ private:
 
 // Return a failure detector for the server with ID `leader`.
 // The handout failure detector is a simple timeout.
+//
+// weakfd BUG: Use a 66ms timeout instead of 1500ms.
+// Message travel = link_delay (20ms) + Expo(20ms).
+// P(delay > 66ms) = exp(-(66-20)/20) = exp(-ln(10)) = 0.10.
+// So ~10% of correct leaders are falsely suspected each round,
+// violating eventual weak accuracy.
 
 cot::event server::failure_detector(int leader) {
     (void) leader;
-    if (weakfd && net_.coin_flip(0.10)) {
-        return cot::after(15min);   // BUG: way too long
-    }
+    // BUG: weakened failure detector. 10% false positive rate
+    if (weakfd) { return cot::after(66ms); }
     return cot::after(1500ms);
 }
 
