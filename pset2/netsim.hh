@@ -49,6 +49,10 @@ struct channel {
     bool verbose() const noexcept { return verbose_; }
     void set_verbose(bool verbose) noexcept { verbose_ = verbose; }
 
+    // fail this channel: all future sends are silently dropped
+    void fail() noexcept { failed_ = true; }
+    bool failed() const noexcept { return failed_; }
+
     // send a message on this channel
     cot::task<> send(message_type m);
 
@@ -58,9 +62,11 @@ private:
     port<T>& to_port_;
     bool verbose_;
     network<T>& net_;
+    bool failed_ = false;
 
     cot::clock::duration link_delay_ = 20ms; // time for message to arrive
     cot::clock::duration send_delay_ = 1ms;  // time before sender can continue
+    cot::clock::duration recv_delay_ = 1ms;  // time before sender can continue
 
     cot::task<> send_after(cot::clock::duration, message_type);
 };
@@ -118,13 +124,26 @@ private:
 
 template <typename T>
 cot::task<> channel<T>::send(message_type m) {
+    if (failed_) {
+        // silently drop the message and return after delay (time taken to detect fail)
+        co_await cot::after(send_delay_);
+        co_return;
+    }
+
     if (verbose_) {
         std::print("{}: {} → {} \"{}\"\n", cot::now(), source(), destination(),
                    message_traits_type::print_transform(m));
     }
 
-    // after `link_delay_`, place the message in the receiver’s queue
-    send_after(link_delay_, std::move(m)).detach();
+    // jitter: base link delay + expo rv component
+    auto jitter = net_.exponential(link_delay_);
+    auto total_delay = link_delay_ + jitter;
+
+    // clamp to 60s to avoid simulating indefinite delay
+    total_delay = std::min(total_delay, cot::clock::duration(60s));
+
+    // after randomized delay, place the message in the receiver's queue
+    send_after(total_delay, std::move(m)).detach();
 
     // sending a message takes time
     co_await cot::after(send_delay_);
@@ -166,8 +185,8 @@ cot::task<T> port<T>::receive() {
                    message_traits_type::print_transform(m));
     }
 
-    // NB could also model receive_delay_, like `send()`’s send_delay_,
-    // but don’t bother in handout code
+    // model computation delay on receive
+    co_await cot::after(net_.exponential(recv_delay_));
 
     co_return m;
 }
@@ -413,4 +432,15 @@ struct message_traits<std::shared_ptr<T>> {
     }
 };
 
+// fail_server_after(net, i, N, delay)
+//    After `delay`, fail all channels originating from server `i`
+//    (including to Nancy at id -1). Models a server crash.
+template <typename T>
+cot::task<> fail_server_after(network<T>& net, int i, int N, cot::clock::duration delay) {
+    assert(i >= 0 && i < N);
+    co_await cot::after(delay);
+    for (int j = -1 /* Nancy */; j != N; ++j) {
+        net.link(i, j).fail();
+    }
+}
 }
