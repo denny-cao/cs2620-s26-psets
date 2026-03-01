@@ -1,7 +1,9 @@
 #include "cotamer.hh"
 #include "netsim.hh"
 #include "ctconsensus_msgs.hh"
+#include <algorithm>
 #include <list>
+#include <numeric>
 #include <print>
 #include <getopt.h>
 
@@ -68,6 +70,9 @@ private:
 
 cot::event server::failure_detector(int leader) {
     (void) leader;
+    if (weakfd && net_.coin_flip(0.10)) {
+        return cot::after(15min);   // BUG: way too long
+    }
     return cot::after(1500ms);
 }
 
@@ -213,6 +218,7 @@ cot::task<> server::consensus() {
 
 bool nancy_approves = false;
 bool nancy_be_quiet = false;
+bool weakfd = false;
 
 cot::task<> nancy_is_impatient();
 
@@ -285,6 +291,7 @@ cot::task<> nancy_is_impatient() {
 // Main entry point
 
 static int N = 3;
+static int num_failures = -1;  // -1 = random up to max, 0 = none, >0 = that many
 
 static bool try_one_seed(ctconsensus::network_type& net,
                          std::optional<unsigned long> seed) {
@@ -309,6 +316,23 @@ static bool try_one_seed(ctconsensus::network_type& net,
         servers.back().consensus().detach();
     }
 
+    // Fail some servers w/cap to stay within CT tolerance
+    int max_failures = (N - 1) / 2;
+    int failures = num_failures;
+    if (failures < 0) { failures = net.uniform(0, max_failures); } // neg => random
+    failures = std::min(failures, max_failures); // cap to max
+    if (failures > 0) {
+        // pick which servers to fail (shuffle IDs and take the first `failures`)
+        std::vector<int> ids(N);
+        std::iota(ids.begin(), ids.end(), 0);
+        std::shuffle(ids.begin(), ids.end(), net.randomness());
+        for (int f = 0; f < failures; ++f) {
+            // fail each chosen server after a random delay (100ms–5s)
+            auto delay = net.uniform(100ms, 5s);
+            netsim::fail_server_after(net, ids[f], N, delay).detach();
+        }
+    }
+
     // start Nancy, who collects DECIDE messages and validates them
     ctconsensus::nancy(net.input(ctconsensus::nancy_id), N, required_consensus)
         .detach();
@@ -323,8 +347,10 @@ static struct option options[] = {
     { "count", required_argument, nullptr, 'n' },
     { "seed", required_argument, nullptr, 'S' },
     { "random-seeds", required_argument, nullptr, 'R' },
+    { "failures", required_argument, nullptr, 'f' },
     { "verbose", no_argument, nullptr, 'V' },
     { "quiet", no_argument, nullptr, 'q' },
+    { "weakfd", no_argument, nullptr, 'w' },
     { nullptr, 0, nullptr, 0 }
 };
 
@@ -351,10 +377,14 @@ int main(int argc, char* argv[]) {
             first_seed = from_str_chars<unsigned long>(optarg);
         } else if (ch == 'R') {
             seed_count = from_str_chars<unsigned long>(optarg);
+        } else if (ch == 'f') {
+            num_failures = from_str_chars<int>(optarg);
         } else if (ch == 'V') {
             net.set_verbose(true);
         } else if (ch == 'q') {
             ctconsensus::nancy_be_quiet = true;
+        } else if (ch == 'w') {
+            ctconsensus::weakfd = true;
         } else {
             std::print(std::cerr, "Unknown option\n");
             return 1;
