@@ -23,6 +23,9 @@ using port_type = netsim::port<message>;
 // the ID of the distinguished server that receives final decisions
 constexpr int nancy_id = -1;
 
+// bug flags (set via command-line options)
+bool weakfd = false;
+
 
 // server
 //    Represents the state for a consensus server. The consensus algorithm
@@ -218,7 +221,6 @@ cot::task<> server::consensus() {
 
 bool nancy_approves = false;
 bool nancy_be_quiet = false;
-bool weakfd = false;
 
 cot::task<> nancy_is_impatient();
 
