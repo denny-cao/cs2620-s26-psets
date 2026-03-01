@@ -66,7 +66,6 @@ private:
 
     cot::clock::duration link_delay_ = 20ms; // time for message to arrive
     cot::clock::duration send_delay_ = 1ms;  // time before sender can continue
-    cot::clock::duration recv_delay_ = 1ms;  // time before sender can continue
 
     cot::task<> send_after(cot::clock::duration, message_type);
 };
@@ -113,6 +112,7 @@ private:
 
     std::deque<message_type> messageq_;
     cot::event receiver_event_;
+    cot::clock::duration recv_delay_ = 100us; // computation delay on receive
 };
 
 
