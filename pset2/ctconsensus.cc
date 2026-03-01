@@ -5,6 +5,7 @@
 #include <list>
 #include <numeric>
 #include <print>
+#include <set>
 #include <getopt.h>
 
 namespace cot = cotamer;
@@ -25,6 +26,7 @@ constexpr int nancy_id = -1;
 
 // bug flags (set via command-line options)
 bool weakfd = false;
+bool dropdecide = false;
 
 
 // server
@@ -58,6 +60,9 @@ private:
     // set when we decide
     bool decided_ = false;
 
+    // track servers we've suspected via FD
+    std::set<int> suspected_;
+
     cot::event failure_detector(int leader);
     inline message pop_stash() {
         auto m = stash_.front();
@@ -79,7 +84,7 @@ private:
 
 cot::event server::failure_detector(int leader) {
     (void) leader;
-    // BUG: weakened failure detector. 10% false positive rate
+    // BUG (weakfd): 10% false positive rate
     if (weakfd) { return cot::after(66ms); }
     return cot::after(1500ms);
 }
@@ -177,6 +182,9 @@ cot::task<> server::consensus() {
         } else if (maybe_propose) {
             color_ = maybe_propose->color;
             color_round_ = round_;
+        } else if (dropdecide) {
+            // FD fired => record this leader as suspected
+            suspected_.insert(leader);
         }
         co_await net_.link(id_, leader).send(
             ack_message(round_, (bool) maybe_propose)
@@ -212,8 +220,11 @@ cot::task<> server::consensus() {
     // send DECIDE to Nancy
     co_await net_.link(id_, nancy_id).send(decide);
     // send DECIDE to everyone else
+    // BUG (dropdecide): skip retransmission to servers we previously
+    // suspected. If they were merely slow (not crashed), they'll
+    // never learn the decision and get stuck.
     for (int j = 0; j != N_; ++j) {
-        if (j != id_) {
+        if (j != id_ && !(dropdecide && suspected_.count(j))) {
             co_await net_.link(id_, j).send(decide);
         }
     }
@@ -358,6 +369,7 @@ static struct option options[] = {
     { "verbose", no_argument, nullptr, 'V' },
     { "quiet", no_argument, nullptr, 'q' },
     { "weakfd", no_argument, nullptr, 'w' },
+    { "dropdecide", no_argument, nullptr, 'd' },
     { nullptr, 0, nullptr, 0 }
 };
 
@@ -392,6 +404,8 @@ int main(int argc, char* argv[]) {
             ctconsensus::nancy_be_quiet = true;
         } else if (ch == 'w') {
             ctconsensus::weakfd = true;
+        } else if (ch == 'd') {
+            ctconsensus::dropdecide = true;
         } else {
             std::print(std::cerr, "Unknown option\n");
             return 1;
