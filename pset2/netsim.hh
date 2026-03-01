@@ -113,7 +113,7 @@ private:
     std::deque<message_type> messageq_;
     cot::event receiver_event_;
 
-    cot::clock::duration recv_delay_ = 100us;  // time to process a received message
+    cot::clock::duration recv_delay_ = 2ms;  // time to process a received message
 };
 
 
@@ -139,11 +139,13 @@ cot::task<> channel<T>::send(message_type m) {
                    message_traits_type::print_transform(m));
     }
 
-    // jitter: base link delay + expo rv component
-    auto jitter = net_.exponential(link_delay_);
-//    // jitter: base link delay + normal rv component
-//    auto jitter = net_.normal(1000ms, 200ms);   
+//    // jitter: base link delay + expo rv component
+//    auto jitter = net_.exponential(link_delay_);
+    // jitter: normal rv component 
+    auto jitter = net_.normal(link_delay_, 5ms);
+    // clamp
     if (jitter < 0ms) { jitter = 0ms; }
+    if (jitter > 600ms) { jitter = 500ms; }
     auto total_delay = link_delay_ + jitter;
 
     // after randomized delay, place the message in the receiver's queue
@@ -190,7 +192,10 @@ cot::task<T> port<T>::receive() {
     }
 
     // model computation delay on receive
-    co_await cot::after(net_.exponential(recv_delay_));
+//    co_await cot::after(net_.exponential(recv_delay_));
+    co_await cot::after(net_.normal(recv_delay_, 1ms));
+    if (recv_delay_ < 0ms) { recv_delay_ = 0ms; }
+    if (recv_delay_ > 100ms) { recv_delay_ = 100ms; }
 
     co_return m;
 }
