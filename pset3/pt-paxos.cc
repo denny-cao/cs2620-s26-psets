@@ -1,6 +1,9 @@
 #include "lockseq_model.hh"
 #include "pancydb.hh"
 #include "netsim.hh"
+#include <map>
+#include <set>
+#include <variant>
 
 namespace cot = cotamer;
 using namespace std::chrono_literals;
@@ -40,12 +43,73 @@ struct testinfo {
 
 struct pt_paxos_instance;
 
-// The type for inter-replica messages. You will change this!
-using paxos_message = /* YOUR TYPE HERE */ int;
+struct paxos_propose {
+    size_t leader;
+    uint64_t slot;
+    pancy::request req;
+};
+
+struct paxos_ack {
+    size_t replica;
+    uint64_t slot;
+};
+
+struct paxos_decide {
+    size_t leader;
+    uint64_t slot;
+    pancy::request req;
+};
+
+using paxos_message = std::variant<
+    paxos_propose,
+    paxos_ack,
+    paxos_decide
+>;
+
+namespace std {
+template <typename CharT>
+struct formatter<paxos_propose, CharT> : formatter<const char*, CharT> {
+    using parent = formatter<const char*, CharT>;
+    template <typename FormatContext>
+    auto format(const paxos_propose& m, FormatContext& ctx) const {
+        return std::format_to(ctx.out(), "PROPOSE(slot={}, serial={})", m.slot, pancy::message_serial(m.req));
+    }
+};
+
+template <typename CharT>
+struct formatter<paxos_ack, CharT> : formatter<const char*, CharT> {
+    using parent = formatter<const char*, CharT>;
+    template <typename FormatContext>
+    auto format(const paxos_ack& m, FormatContext& ctx) const {
+        return std::format_to(ctx.out(), "ACK(slot={}, from=R{})", m.slot, m.replica);
+    }
+};
+
+template <typename CharT>
+struct formatter<paxos_decide, CharT> : formatter<const char*, CharT> {
+    using parent = formatter<const char*, CharT>;
+    template <typename FormatContext>
+    auto format(const paxos_decide& m, FormatContext& ctx) const {
+        return std::format_to(ctx.out(), "DECIDE(slot={}, serial={})", m.slot, pancy::message_serial(m.req));
+    }
+};
+}
+
+namespace netsim {
+template <>
+struct message_traits<paxos_message> {
+    static auto print_transform(const paxos_message& m) {
+        return std::visit([](const auto& msg) {
+            return std::format("{}", msg);
+        }, m);
+    }
+};
+}
 
 struct pt_paxos_replica {
     size_t index_;           // index of this replica in the replica set
     size_t nreplicas_;       // number of replicas
+    size_t quorum_size_ = nreplicas_ / 2 + 1; // number of ACKs needed for quorum
     size_t leader_index_;    // this replica’s idea of the current leader
     netsim::port<pancy::request> from_clients_;   // port for client messages
     netsim::port<paxos_message> from_replicas_;   // port for inter-replica messages
@@ -53,7 +117,9 @@ struct pt_paxos_replica {
     // channels for inter-replica messages:
     std::vector<std::unique_ptr<netsim::channel<paxos_message>>> to_replicas_;
     pancy::pancydb db_;      // our copy of the database
-    // ...plus anything you want to add
+    uint64_t next_slot_ = 1; // next slot leader will assign (Each client req appends one entry to AV)
+    uint64_t next_decide_slot_ = 1; // length of decided and applied prefix 
+    std::map<uint64_t, pancy::request> decided_reqs_; // decided but not yet applied slots 
 
     pt_paxos_replica(size_t index, size_t nreplicas, random_source&);
     void initialize(pt_paxos_instance&);
@@ -115,22 +181,88 @@ pt_paxos_instance::pt_paxos_instance(testinfo& tester, client_model& clients)
 // ********** PANCY SERVICE CODE **********
 
 cot::task<> pt_paxos_replica::run() {
-    // Your code here! The handout code just implements a single primary.
+    // Leader: Track proposals awaiting a quorum of ACKs
+    struct slot_info {
+        pancy::request req;
+        size_t acks = 0; // number of ACKs received so far; QUORUM
+    };
+    std::map<uint64_t, slot_info> pending_; // slots prop but not yet decided
+
 
     while (true) {
-        // receive message
-        auto req = co_await from_clients_.receive();
+        // receive from clients or replicas
+        auto result = co_await cot::first(from_clients_.receive(), from_replicas_.receive());
 
-        // if not leader, redirect
-        if (index_ != leader_index_) {
-            co_await to_clients_.send(pancy::redirection_response{
-                pancy::response_header(req, pancy::errc::redirect), leader_index_
-            });
-            continue;
+        // PROPOSE PHASE (LEADER)
+        // Skip PROBE/PREP because leader_index_ fixed; never change. STABLE LEADER!
+        if (auto* req_p = std::get_if<pancy::request>(&result)) {
+            // if not leader, redirect
+            if (index_ != leader_index_) {
+                co_await to_clients_.send(pancy::redirection_response{
+                    pancy::response_header(*req_p, pancy::errc::redirect), leader_index_
+                });
+                continue;
+            }
+
+            // av += 1. assign next slot, record req in pending
+            uint64_t slot = next_slot_++;
+            pending_[slot] = slot_info{*req_p, 0};
+
+            // PROPOSE(pr, V) to all replicas
+            paxos_propose prop{index_, slot, *req_p};
+            for (size_t i = 0; i < nreplicas_; ++i) {
+                co_await to_replicas_[i]->send(prop);
+            }
         }
+        
+        else {
+            auto& msg = std::get<paxos_message>(result);
 
-        // if leader, process message and send response
-        co_await to_clients_.send(db_.process_req(req));
+            // PROPOSE PHASE (FOLLOWERS)
+            if (auto* prop_p = std::get_if<paxos_propose>(&msg)) {
+                // ACK(ar, |AV|) 
+                // slot number is |AV|!!!! prefix we ack
+                co_await to_replicas_[prop_p->leader]->send(paxos_ack{index_, prop_p->slot});
+            }
+
+            // ACK PHASE (LEADER)
+            else if (auto* ack_p = std::get_if<paxos_ack>(&msg)) {
+                // Update pending_ with received ACK
+                auto it = pending_.find(ack_p->slot);
+                if (it == pending_.end()) {continue; } // Stale ACK
+
+                // Check quorum
+                if (++it->second.acks == quorum_size_) {
+                    // DECIDE(r, min wk)
+                    paxos_decide dec{index_, ack_p->slot, it->second.req};
+                    for (size_t i = 0; i < nreplicas_; ++i) {
+                        co_await to_replicas_[i]->send(dec);
+                    }
+                }
+            }
+
+            // DECIDE PHASE (ALL)
+            else if (auto* dec_p = std::get_if<paxos_decide>(&msg)) {
+                decided_reqs_[dec_p->slot] = dec_p->req;
+
+                // apply all decided but not yet applied reqs in order
+                while (true) {
+                    auto it = decided_reqs_.find(next_decide_slot_);
+                    if (it == decided_reqs_.end()) { break; } // No more decided reqs to apply
+
+                    // apply req to db, respond to client, remove from pending_ and decided_reqs_
+                    pancy::response resp = db_.process_req(it->second);
+                    if (index_ == leader_index_) {
+                        co_await to_clients_.send(resp);
+                    }
+
+
+                    pending_.erase(it->first);
+                    decided_reqs_.erase(it);
+                    ++next_decide_slot_;
+                }
+            }
+        }
     }
 }
 
