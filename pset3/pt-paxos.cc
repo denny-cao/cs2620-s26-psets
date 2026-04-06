@@ -32,6 +32,11 @@ struct testinfo {
     void configure_quiet_channel(netsim::channel<T>& chan) {
         chan.set_loss(loss);
     }
+    template <typename T>
+    void configure_replica_channel(netsim::channel<T>& chan) {
+        chan.set_loss(loss); 
+        chan.set_verbose(verbose);
+    }
 };
 
 
@@ -52,6 +57,7 @@ struct paxos_propose {
 struct paxos_ack {
     size_t replica;
     uint64_t slot;
+    uint64_t next; // follower next_decide_slot_ PURPOSE: ACK up to slot, so leader can truncate pending_ and resend PROPOSEs with correct slot numbers
 };
 
 struct paxos_decide {
@@ -162,7 +168,7 @@ void pt_paxos_replica::initialize(pt_paxos_instance& inst) {
     inst.tester.configure_quiet_channel(inst.clients.request_channel(index_));
     for (size_t s = 0UL; s != nreplicas_; ++s) {
         to_replicas_[s]->connect(inst.replicas[s]->from_replicas_);
-        inst.tester.configure_channel(*to_replicas_[s]);
+        inst.tester.configure_replica_channel(*to_replicas_[s]);
     }
 }
 
@@ -184,14 +190,37 @@ cot::task<> pt_paxos_replica::run() {
     // Leader: Track proposals awaiting a quorum of ACKs
     struct slot_info {
         pancy::request req;
-        size_t acks = 0; // number of ACKs received so far; QUORUM
+        std::set<size_t> acked_by; // replicas that have ACKed 
+        std::set<size_t> decided_by; // replicas that have DECIDEd
     };
     std::map<uint64_t, slot_info> pending_; // slots prop but not yet decided
 
 
     while (true) {
         // receive from clients or replicas
-        auto result = co_await cot::first(from_clients_.receive(), from_replicas_.receive());
+        auto result = co_await cot::first(from_clients_.receive(), from_replicas_.receive(), cot::after(200ms));
+
+        // TIMEOUT: retransmit 
+        if (std::holds_alternative<std::monostate>(result)) {
+            for (auto& [slot, info]: pending_) {
+                // Retransmit PROPOSE(pr, V) to all replicas that haven’t ACKed yet
+                paxos_propose prop{index_, slot, info.req};
+                for (size_t i = 0; i < nreplicas_; ++i) {
+                    if (!info.acked_by.count(i)) {
+                        co_await to_replicas_[i]->send(prop);
+                    }
+                }
+
+                // Retransmit DECIDE(r, min wk) to all replicas that haven’t DECIDEd yet
+                paxos_decide dec{index_, slot, info.req};
+                for (size_t i = 0; i < nreplicas_; ++i) {
+                    if (!info.decided_by.count(i)) {
+                        co_await to_replicas_[i]->send(dec);   
+                    }
+                }
+            }
+            continue;
+        }
 
         // PROPOSE PHASE (LEADER)
         // Skip PROBE/PREP because leader_index_ fixed; never change. STABLE LEADER!
@@ -206,7 +235,7 @@ cot::task<> pt_paxos_replica::run() {
 
             // av += 1. assign next slot, record req in pending
             uint64_t slot = next_slot_++;
-            pending_[slot] = slot_info{*req_p, 0};
+            pending_[slot] = slot_info{*req_p, {}, {}};
 
             // PROPOSE(pr, V) to all replicas
             paxos_propose prop{index_, slot, *req_p};
@@ -222,21 +251,41 @@ cot::task<> pt_paxos_replica::run() {
             if (auto* prop_p = std::get_if<paxos_propose>(&msg)) {
                 // ACK(ar, |AV|) 
                 // slot number is |AV|!!!! prefix we ack
-                co_await to_replicas_[prop_p->leader]->send(paxos_ack{index_, prop_p->slot});
+                co_await to_replicas_[prop_p->leader]->send(paxos_ack{index_, prop_p->slot, next_decide_slot_});
             }
 
             // ACK PHASE (LEADER)
             else if (auto* ack_p = std::get_if<paxos_ack>(&msg)) {
+                //update decided_by for slots follower has ACKed for
+                for (auto& [slot, info]: pending_) {
+                    if (ack_p->next > slot) {
+                        info.decided_by.insert(ack_p->replica);
+                    }
+                }
+
                 // Update pending_ with received ACK
                 auto it = pending_.find(ack_p->slot);
                 if (it == pending_.end()) {continue; } // Stale ACK
 
                 // Check quorum
-                if (++it->second.acks == quorum_size_) {
+                it->second.acked_by.insert(ack_p->replica);
+                if (it->second.acked_by.size() == quorum_size_) {
                     // DECIDE(r, min wk)
                     paxos_decide dec{index_, ack_p->slot, it->second.req};
                     for (size_t i = 0; i < nreplicas_; ++i) {
                         co_await to_replicas_[i]->send(dec);
+                    }
+                }
+
+                // TRUNCATE SLOTS 
+                // erase front of pending_ while all nreplicas have ACKed and DECIDEd
+                while (!pending_.empty()) {
+                    auto& [slot, info] = *pending_.begin();
+                    if (info.acked_by.size() == nreplicas_ && info.decided_by.size() == nreplicas_) {
+                        pending_.erase(pending_.begin());
+                    } 
+                    else {
+                        break;
                     }
                 }
             }
@@ -256,8 +305,12 @@ cot::task<> pt_paxos_replica::run() {
                         co_await to_clients_.send(resp);
                     }
 
+                    // mark leader as decided for this slot (for truncation)
+                    auto pending_it = pending_.find(it->first);
+                    if (pending_it != pending_.end()) {
+                        pending_it->second.decided_by.insert(index_);
+                    }
 
-                    pending_.erase(it->first);
                     decided_reqs_.erase(it);
                     ++next_decide_slot_;
                 }
@@ -275,6 +328,37 @@ cot::task<> pt_paxos_replica::run() {
 cot::task<> clear_after(cot::duration d) {
     co_await cot::after(d);
     cot::clear();
+}
+
+// Fail replica i
+cot::task<> fail_replica_after(pt_paxos_instance& inst, size_t i, cot::duration d) {
+    co_await cot::after(d);
+    for (size_t j = 0; j < inst.replicas.size(); ++j) {
+        inst.replicas[i]->to_replicas_[j]->set_loss(1.0); // drop outgoing
+    }
+    inst.replicas[i]->to_clients_.set_loss(1.0); // drop incoming
+}
+
+// Fail and recover
+cot::task<> fail_then_recover(pt_paxos_instance& inst, size_t i, cot::duration fail_at, cot::duration recover_at, double original_loss) {
+    co_await cot::after(fail_at);
+    for (size_t j = 0; j < inst.replicas.size(); ++j) { inst.replicas[i]->to_replicas_[j]->set_loss(1.0); } // drop outgoing 
+    inst.replicas[i]->to_clients_.set_loss(1.0); // drop incoming
+
+    co_await cot::after(recover_at - fail_at);
+    for (size_t j = 0; j < inst.replicas.size(); ++j) { inst.replicas[i]->to_replicas_[j]->set_loss(original_loss); } // restore outgoing
+    inst.replicas[i]->to_clients_.set_loss(original_loss); // restore incoming
+}
+
+// Split brain
+// replicas can talk to clients but not each other
+cot::task<> split_brain_after(pt_paxos_instance& inst, cot::duration d) {
+    co_await cot::after(d);
+    for (size_t i = 0; i < inst.replicas.size(); ++i) {
+        for (size_t j = 0; j < inst.replicas.size(); ++j) {
+            if (i != j) { inst.replicas[i]->to_replicas_[j]->set_loss(1.0); } // drop inter-replica messages
+        }
+    }
 }
 
 bool try_one_seed(testinfo& tester, unsigned long seed) {
