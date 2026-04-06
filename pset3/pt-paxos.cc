@@ -66,10 +66,24 @@ struct paxos_decide {
     pancy::request req;
 };
 
+struct paxos_probe {
+    size_t candidate; // the replica that thinks it might be leader
+    uint64_t round; // new round num
+};
+
+struct paxos_prepare {
+    size_t replica;
+    uint64_t round;
+    uint64_t ack_round;
+    uint64_t next_decide_slot;
+};
+
 using paxos_message = std::variant<
     paxos_propose,
     paxos_ack,
-    paxos_decide
+    paxos_decide,
+    paxos_probe,    
+    paxos_prepare
 >;
 
 namespace std {
@@ -99,6 +113,24 @@ struct formatter<paxos_decide, CharT> : formatter<const char*, CharT> {
         return std::format_to(ctx.out(), "DECIDE(slot={}, serial={})", m.slot, pancy::message_serial(m.req));
     }
 };
+
+template <typename CharT>
+struct formatter<paxos_probe, CharT> : formatter<const char*, CharT> {
+    using parent = formatter<const char*, CharT>;
+    template <typename FormatContext>
+    auto format(const paxos_probe& m, FormatContext& ctx) const {
+        return std::format_to(ctx.out(), "PROBE(round={}, from=R{})", m.round, m.candidate);
+    }
+};
+
+template <typename CharT>
+struct formatter<paxos_prepare, CharT> : formatter<const char*, CharT> {
+    using parent = formatter<const char*, CharT>;
+    template <typename FormatContext>
+    auto format(const paxos_prepare& m, FormatContext& ctx) const {
+        return std::format_to(ctx.out(), "PREPARE(round={}, from=R{})", m.round, m.replica);
+    }
+};  
 }
 
 namespace netsim {
@@ -126,6 +158,9 @@ struct pt_paxos_replica {
     uint64_t next_slot_ = 1; // next slot leader will assign (Each client req appends one entry to AV)
     uint64_t next_decide_slot_ = 1; // length of decided and applied prefix 
     std::map<uint64_t, pancy::request> decided_reqs_; // decided but not yet applied slots 
+
+    uint64_t round_ = 0; // pr_s
+    uint64_t ack_round_ = 0; // ar_s
 
     pt_paxos_replica(size_t index, size_t nreplicas, random_source&);
     void initialize(pt_paxos_instance&);
@@ -187,7 +222,7 @@ pt_paxos_instance::pt_paxos_instance(testinfo& tester, client_model& clients)
 // ********** PANCY SERVICE CODE **********
 
 cot::task<> pt_paxos_replica::run() {
-    // Leader: Track proposals awaiting a quorum of ACKs
+    // Leader state: Track proposals awaiting a quorum of ACKs
     struct slot_info {
         pancy::request req;
         std::set<size_t> acked_by; // replicas that have ACKed 
@@ -195,35 +230,83 @@ cot::task<> pt_paxos_replica::run() {
     };
     std::map<uint64_t, slot_info> pending_; // slots prop but not yet decided
 
+    // Election state
+    struct prepare_response {
+        size_t replica;
+        uint64_t ack_round;
+        uint64_t next_decide_slot;
+    };
+    std::vector<prepare_response> prepare_responses_; // responses to our PREPAREs
+    uint64_t election_round_ = 0; // round trying to win
+
+    // FD
+    cot::system_time_point last_leader_msg_ = cot::now();
+    constexpr cot::duration LEADER_TIMEOUT = 5s;
 
     while (true) {
         // receive from clients or replicas
+        // NOTE: 200 FOR RETRANSMITION, LEADER_TIMEOUT FOR ELECTION
         auto result = co_await cot::first(from_clients_.receive(), from_replicas_.receive(), cot::after(200ms));
 
-        // TIMEOUT: retransmit 
+        /* 
+            TIMEOUT
+            Leader: Retransmit unACKed PROPOSEs and unDECIDED slots
+            Non-leader: Check FD: If no response from leader, start PROBE to elect self as leader
+        */
         if (std::holds_alternative<std::monostate>(result)) {
-            for (auto& [slot, info]: pending_) {
-                // Retransmit PROPOSE(pr, V) to all replicas that haven’t ACKed yet
-                paxos_propose prop{index_, slot, info.req};
-                for (size_t i = 0; i < nreplicas_; ++i) {
-                    if (!info.acked_by.count(i)) {
-                        co_await to_replicas_[i]->send(prop);
+            // Leader
+            if (index_ == leader_index_) {
+                for (auto& [slot, info]: pending_) {
+                    if (info.acked_by.size() < quorum_size_) {
+                        // Retransmit PROPOSE(pr, V) to all replicas that haven’t ACKed yet
+                        paxos_propose prop{index_, slot, info.req};
+                        for (size_t i = 0; i < nreplicas_; ++i) {
+                            if (!info.acked_by.count(i)) {
+                                co_await to_replicas_[i]->send(prop);
+                            }
+                        }
+                    }
+                    else {
+                        // Retransmit DECIDE(r, min wk) to all replicas that haven’t DECIDEd yet
+                        paxos_decide dec{index_, slot, info.req};
+                        for (size_t i = 0; i < nreplicas_; ++i) {
+                            if (!info.decided_by.count(i)) {
+                                co_await to_replicas_[i]->send(dec);   
+                            }
+                        }
                     }
                 }
+            }
+            // Non-leader
+            else {
+                if (cot::now() - last_leader_msg_ > LEADER_TIMEOUT) {
+                    /*
+                        PROBE(r) to all replicas w/r > pr_s
+                        unique ruonds w/replica index as lower bits
+                    */
+                   uint64_t new_round = next_decide_slot_ * nreplicas_ + index_; // unique round number higher than any pr_s
+                   if (new_round <= round_) {
+                        // someone else alr used higher round; go higher
+                        new_round = (round_ / nreplicas_ + 1) * nreplicas_ + index_;
+                   }
+                   round_ = new_round;
+                   election_round_ = new_round;
+                   prepare_responses_.clear();
 
-                // Retransmit DECIDE(r, min wk) to all replicas that haven’t DECIDEd yet
-                paxos_decide dec{index_, slot, info.req};
-                for (size_t i = 0; i < nreplicas_; ++i) {
-                    if (!info.decided_by.count(i)) {
-                        co_await to_replicas_[i]->send(dec);   
-                    }
+                   // PROBE(r) to all replicas
+                   paxos_probe probe{index_, round_};
+                   for (size_t i = 0; i < nreplicas_; ++i) {
+                        co_await to_replicas_[i]->send(probe);
+                   }
                 }
             }
             continue;
         }
-
-        // PROPOSE PHASE (LEADER)
-        // Skip PROBE/PREP because leader_index_ fixed; never change. STABLE LEADER!
+        
+        /*
+            Leader
+            Client request -> PROPOSE  
+        */
         if (auto* req_p = std::get_if<pancy::request>(&result)) {
             // if not leader, redirect
             if (index_ != leader_index_) {
@@ -232,6 +315,9 @@ cot::task<> pt_paxos_replica::run() {
                 });
                 continue;
             }
+
+            // don't accept req if election
+            if (election_round_ != 0) { continue; }
 
             // av += 1. assign next slot, record req in pending
             uint64_t slot = next_slot_++;
@@ -247,14 +333,79 @@ cot::task<> pt_paxos_replica::run() {
         else {
             auto& msg = std::get<paxos_message>(result);
 
-            // PROPOSE PHASE (FOLLOWERS)
-            if (auto* prop_p = std::get_if<paxos_propose>(&msg)) {
-                // ACK(ar, |AV|) 
-                // slot number is |AV|!!!! prefix we ack
-                co_await to_replicas_[prop_p->leader]->send(paxos_ack{index_, prop_p->slot, next_decide_slot_});
+            /*
+                Non-leader
+                PROBE received -> PREPARE
+                send next_decide_slot_ instead of full AV
+                new leader uses to find furthest-ahead rep to sync from
+            */
+            if (auto* prope_p = std::get_if<paxos_probe>(&msg)) {
+                // ignore if old r
+                if (prope_p->round < round_) { continue; }
+
+                // update pr_s and abandon curr leader
+                round_ = prope_p->round;
+                ack_round_ = 0; // reset ar for new round
+                leader_index_ = prope_p->candidate;
+                last_leader_msg_ = cot::now();
+
+                // PREPARE(ar, r, AV) to all replicas
+                paxos_prepare prep{index_, round_, ack_round_, next_decide_slot_};
+                co_await to_replicas_[prope_p->candidate]->send(prep);
+            }
+            /*
+                New leader/candidate
+                PREPARE received -> PROPOSE
+                Find replica w/max next_decide_slot_ as starting point.
+                Apply slots missing before proceeding
+            */
+            else if (auto* prep_p = std::get_if<paxos_prepare>(&msg)) {
+                if (prep_p->round != election_round_) { continue; } // stale PREPARE from old election
+                if (prep_p->round < round_) {
+                    // usurped => abandon election
+                    election_round_ = 0;
+                    continue;
+                }
+
+                prepare_responses_.push_back({prep_p->replica, prep_p->ack_round, prep_p->next_decide_slot});
+
+                if (prepare_responses_.size() == quorum_size_) {
+                    // quorum of PREPAREs received => now leader
+
+                    // find max next_decide_slot_ among responses to determine where to sync from
+                    uint64_t max_decided = next_decide_slot_;
+                    for (const auto& resp: prepare_responses_) {
+                        max_decided = std::max(max_decided, resp.next_decide_slot);
+                    }
+
+                    // start accepting req from next_slot_ = max_decided
+                    // any slot between next_decide_slot_ and max_decided missing filled via PROPOSE retransmits from new round
+                    leader_index_ = index_;
+                    next_slot_ = max_decided + 1;
+                    ack_round_ = round_; 
+                    election_round_ = 0; // end election
+                    pending_.clear(); // old round pending_ is stale
+                    last_leader_msg_ = cot::now();
+                }
+            }
+            
+            /*
+                Non-leader
+                PROPOSE received -> ACK
+            */
+            else if (auto* prop_p = std::get_if<paxos_propose>(&msg)) {
+                if (prop_p->leader != leader_index_) { continue; } // ignore if not from current leader
+
+                ack_round_ = round_;
+                paxos_ack ack{index_, prop_p->slot, next_decide_slot_}; 
+                co_await to_replicas_[prop_p->leader]->send(ack);
             }
 
-            // ACK PHASE (LEADER)
+            /*
+                Leader
+                ACK received -> DECIDE 
+            */
+
             else if (auto* ack_p = std::get_if<paxos_ack>(&msg)) {
                 //update decided_by for slots follower has ACKed for
                 for (auto& [slot, info]: pending_) {
@@ -281,17 +432,18 @@ cot::task<> pt_paxos_replica::run() {
                 // erase front of pending_ while all nreplicas have ACKed and DECIDEd
                 while (!pending_.empty()) {
                     auto& [slot, info] = *pending_.begin();
-                    if (info.acked_by.size() == nreplicas_ && info.decided_by.size() == nreplicas_) {
-                        pending_.erase(pending_.begin());
-                    } 
-                    else {
-                        break;
-                    }
+                    if (info.acked_by.size() == nreplicas_ && info.decided_by.size() == nreplicas_) { pending_.erase(pending_.begin()); } 
+                    else { break;}
                 }
             }
 
-            // DECIDE PHASE (ALL)
+            /*
+                ALL
+                DECIDE received -> apply req, respond to client
+            */
             else if (auto* dec_p = std::get_if<paxos_decide>(&msg)) {
+                last_leader_msg_ = cot::now();
+
                 decided_reqs_[dec_p->slot] = dec_p->req;
 
                 // apply all decided but not yet applied reqs in order
@@ -376,15 +528,27 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
         tasks.push_back(inst.replicas[s]->run());
     }
     cot::task<> timeout_task = clear_after(100s);
+    // failure scenarios
+    tasks.push_back(fail_replica_after(inst, 0, 10s));
 
     // Wait for `timeout_task`
     cot::loop();
+
+    pancy::pancydb& db = inst.replicas[tester.initial_leader]->db_;
+
+    for (size_t s = 0; s < tester.nreplicas; ++s) {
+        if (s == tester.initial_leader) continue;
+        if (auto key = db.diff(inst.replicas[s]->db_, 20)) {
+            std::print(std::clog, "*** FAILURE on seed {} at replica {} key {}\n", seed, s, *key);
+            inst.replicas[s]->db_.print_near(*key, std::clog);
+            return false;
+        }
+    }
 
     // Check database
     std::print("{} lock, {} write, {} clear, {} unlock\n",
                clients.lock_complete, clients.write_complete,
                clients.clear_complete, clients.unlock_complete);
-    pancy::pancydb& db = inst.replicas[tester.initial_leader]->db_;
     if (auto problem = clients.check(db)) {
         std::print(std::clog, "*** FAILURE on seed {} at key {}\n", seed, *problem);
         db.print_near(*problem, std::clog);
