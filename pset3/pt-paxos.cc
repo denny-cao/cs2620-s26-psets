@@ -206,6 +206,12 @@ struct pt_paxos_replica {
         uint64_t trim_w = 0;
     } leader_;
 
+    // --- Client Dedup ---
+    std::map<uint64_t, pancy::response> committed_response_by_serial_; // if client retries exact same req, leader can answer immediately via map
+    uint64_t client_requests_seen_ = 0;
+    uint64_t dedup_hits_ = 0;
+    uint64_t consensus_inserts_ = 0;
+
     // --- Timing ---
     // last time we heard from leader
     cot::system_time_point last_leader_msg_ = cot::now();
@@ -280,6 +286,11 @@ static bool equal_request(const pancy::request& a, const pancy::request& b) {
     // treat req as equal if their serialized form matches
     // EXTENSIONS
     return pancy::message_serial(a) == pancy::message_serial(b);
+}
+
+static uint64_t request_serial_key(const pancy::request& req) {
+    // get serial
+    return pancy::message_serial(req);
 }
 
 std::vector<pancy::request> pt_paxos_replica::suffix_from(uint64_t base, const std::vector<pancy::request>& seq, uint64_t from) {
@@ -439,7 +450,12 @@ cot::task<> pt_paxos_replica::apply_decisions_up_to(uint64_t limit) {
     // SEND to Nancy / apply to state machine
     uint64_t wprime = std::min<uint64_t>(limit, av_abs_len());
     while (decided_len_ < wprime) {
-        pancy::response resp = db_.process_req(AVs_[decided_len_ - log_start_]);
+        const pancy::request& req = AVs_[decided_len_ - log_start_];
+        pancy::response resp = db_.process_req(req);
+    
+        // DEDUP: Cache committed resp
+        uint64_t serial = request_serial_key(req);
+        committed_response_by_serial_[serial] = resp;
 
         // only the current leader_index_ responds to clients
         if (index_ == leader_index_) { co_await to_clients_.send(resp); }
@@ -575,9 +591,7 @@ cot::task<> pt_paxos_replica::handle_timeout() {
 }
 
 cot::task<> pt_paxos_replica::handle_client_request(const pancy::request& req) {
-    // every client req becomes a candidate initial value
-    IVs_.push_back(req);
-    check_invariants();
+    ++client_requests_seen_;
 
     // redirect if not leader
     if (index_ != leader_index_) {
@@ -585,6 +599,19 @@ cot::task<> pt_paxos_replica::handle_client_request(const pancy::request& req) {
             pancy::response_header(req, pancy::errc::redirect), leader_index_});
         co_return;
     }
+
+    // DEDUP: Short-circuit
+    uint64_t serial = request_serial_key(req);
+    auto it = committed_response_by_serial_.find(serial);
+    if (it != committed_response_by_serial_.end()) {
+        ++dedup_hits_;
+        co_await to_clients_.send(it->second);
+        co_return;
+    }
+
+    IVs_.push_back(req);
+    ++consensus_inserts_;
+    check_invariants();
 
     // if think leader and no active round, start
     if (!leader_.active) { co_await probe(); }
@@ -787,9 +814,20 @@ cot::task<> fail_replica_after(pt_paxos_instance& inst, size_t i, cot::duration 
     }
 }
 
-cot::task<> recover_replica_after(pt_paxos_instance& inst, size_t i, cot::duration d, double original_loss) {
-    // Recover from failure by restoring original loss rates.
-    co_await cot::after(d);
+cot::task<> fail_then_recover(pt_paxos_instance& inst, size_t i,
+        cot::duration fail_at, cot::duration recover_at, double original_loss) {
+    co_await cot::after(fail_at);
+    for (size_t j = 0; j < inst.replicas.size(); ++j) {
+        inst.replicas[i]->to_replicas_[j]->set_loss(1.0);
+    }
+    inst.replicas[i]->to_clients_.set_loss(1.0);
+    for (size_t j = 0; j < inst.replicas.size(); ++j) {
+        if (j != i) {
+            inst.replicas[j]->to_replicas_[i]->set_loss(1.0);
+        }
+    }
+
+    co_await cot::after(recover_at - fail_at);
     for (size_t j = 0; j < inst.replicas.size(); ++j) {
         inst.replicas[i]->to_replicas_[j]->set_loss(original_loss);
     }
@@ -799,12 +837,6 @@ cot::task<> recover_replica_after(pt_paxos_instance& inst, size_t i, cot::durati
             inst.replicas[j]->to_replicas_[i]->set_loss(original_loss);
         }
     }
-}
-
-cot::task<> fail_then_recover(pt_paxos_instance& inst, size_t i,
-        cot::duration fail_at, cot::duration recover_at, double original_loss) {
-    co_await fail_replica_after(inst, i, fail_at);
-    co_await recover_replica_after(inst, i, recover_at, original_loss);
 }
 
 bool try_one_seed(testinfo& tester, unsigned long seed) {
@@ -850,6 +882,13 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
         return false;
     } else if (tester.print_db) {
         db.print(std::cout);
+    }
+
+    // DEDUP STATS
+    for (size_t s = 0; s < tester.nreplicas; ++s) {
+        auto& r = *inst.replicas[s];
+        std::print("R{}: seen={}, dedup_hits={}, consensus_inserts={}\n",
+                   s, r.client_requests_seen_, r.dedup_hits_, r.consensus_inserts_);
     }
     return true;
 }
