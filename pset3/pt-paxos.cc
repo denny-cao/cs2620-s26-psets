@@ -643,7 +643,7 @@ cot::task<> pt_paxos_replica::handle_probe(const mp_probe& m) {
     last_leader_msg_ = cot::now();
 
     // TRUNCATION: if leader says dv slots are definitely decided, trim
-    local_truncate(m.dv);
+    // local_truncate(m.dv);
     check_invariants();
 
     co_await to_replicas_[m.leader]->send(mp_prepare{index_, prs_, ars_, log_start_, decided_len_, AVs_});
@@ -723,7 +723,7 @@ cot::task<> pt_paxos_replica::handle_propose(const mp_propose& m) {
     leader_index_ = m.leader;
     last_leader_msg_ = cot::now();
 
-    local_truncate(decided_len_);
+    // cal_truncate(decided_len_);
     check_invariants();
 
     // ACK back with current absolute acknowledged length
@@ -751,7 +751,7 @@ cot::task<> pt_paxos_replica::handle_ack(const mp_ack& m) {
 
 cot::task<> pt_paxos_replica::handle_decide(const mp_decide& m) {
     // Receive DECIDE(r, w)
-    if (m.r > ars_) { co_return; }
+    if (m.r < ars_) { co_return; }
 
     uint64_t wprime = std::min<uint64_t>(m.w, av_abs_len());
     if (wprime > decided_len_) {
@@ -860,11 +860,17 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
     // Wait for `timeout_task`
     cot::loop();
 
-    pancy::pancydb& db = inst.replicas[tester.initial_leader]->db_;
+    size_t ref = 0;
+    for (size_t s = 1; s < tester.nreplicas; ++s) {
+        if (inst.replicas[s]->decided_len_ > inst.replicas[ref]->decided_len_) {
+            ref = s;
+        }
+    }
+    pancy::pancydb& db = inst.replicas[ref]->db_;
 
     // Check state convergence across replicas
     for (size_t s = 0; s < tester.nreplicas; ++s) {
-        if (s == tester.initial_leader) { continue; }
+        if (s == ref) { continue; }
         if (auto key = db.diff(inst.replicas[s]->db_, 20)) {
             std::print(std::clog, "*** FAILURE on seed {} at replica {} key {}\n", seed, s, *key);
             inst.replicas[s]->db_.print_near(*key, std::clog);
