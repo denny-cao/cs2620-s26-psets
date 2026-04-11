@@ -6,6 +6,7 @@
 #include <variant>
 #include <vector>
 #include <optional>
+#include <algorithm>
 
 namespace cot = cotamer;
 using namespace std::chrono_literals;
@@ -164,8 +165,9 @@ struct pt_paxos_replica {
 
     // --- Multi-Paxos protocol state ---
 
-    std::vector<pancy::request> IVs_;   // all requests not yet truncated by the leader (INITIAL VALUES WAITING)
-    uint64_t iv_base_ = 0;              // absolute slot of IVs_[0]
+//    std::vector<pancy::request> IVs_;   // all requests not yet truncated by the leader (INITIAL VALUES WAITING)
+//    uint64_t iv_base_ = 0;              // absolute slot of IVs_[0]
+    std::vector<pancy::request> pending_reqs_;
     uint64_t prs_ = 0;
     uint64_t ars_ = 0;
     std::vector<pancy::request> AVs_;   // ACK suffix beginning at log_start_ (CHANGED TO SUFFIX FOR TRUNCATION)
@@ -243,6 +245,10 @@ struct pt_paxos_replica {
     // absolute length of curr leader proposal
     uint64_t leader_proposed_abs_len() const { return leader_.proposed_base + leader_.proposed_AV.size(); }
 
+    void erase_pending_request(const pancy::request& req);
+
+    std::map<uint64_t, pancy::request> waiting_client_reqs_;
+
     cot::task<> broadcast(const paxos_message& m);
     cot::task<> apply_decisions_up_to(uint64_t limit);
     cot::task<> decide();
@@ -315,19 +321,47 @@ bool pt_paxos_replica::is_extension(uint64_t old_base, const std::vector<pancy::
     return true;
 }
 
-static std::vector<pancy::request> extend_with_initial_values(
-        uint64_t base,
-        const std::vector<pancy::request>& base_seq,
-        uint64_t iv_base,
-        const std::vector<pancy::request>& IVs) {
-    // starting from some chosen base sequence, append any local initial values that continue after it.
-    // leader chooses V by taking best known ACK seq and appending >= 0 elements of IV seq
+//static std::vector<pancy::request> extend_with_initial_values(
+//        uint64_t base,
+//        const std::vector<pancy::request>& base_seq,
+//        uint64_t iv_base,
+//        const std::vector<pancy::request>& IVs) {
+//    // starting from some chosen base sequence, append any local initial values that continue after it.
+//    // leader chooses V by taking best known ACK seq and appending >= 0 elements of IV seq
+//
+//    std::vector<pancy::request> V = base_seq;
+//    uint64_t next_abs = base + V.size();
+//    uint64_t iv_end = iv_base + IVs.size();
+//    for (uint64_t abs = next_abs; abs < iv_end; ++abs) { V.push_back(IVs[abs - iv_base]); }
+//    return V;
+//}
 
-    std::vector<pancy::request> V = base_seq;
-    uint64_t next_abs = base + V.size();
-    uint64_t iv_end = iv_base + IVs.size();
-    for (uint64_t abs = next_abs; abs < iv_end; ++abs) { V.push_back(IVs[abs - iv_base]); }
-    return V;
+static bool contains_request(const std::vector<pancy::request>& seq,
+                             const pancy::request& req) {
+    for (const auto& x : seq) {
+        if (equal_request(x, req)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::vector<pancy::request> append_pending_requests(
+        const std::vector<pancy::request>& base_seq,
+        const std::vector<pancy::request>& pending) {
+    std::vector<pancy::request> out = base_seq;
+    for (const auto& req : pending) {
+        if (!contains_request(out, req)) {
+            out.push_back(req);
+        }
+    }
+    return out;
+}
+
+void pt_paxos_replica::erase_pending_request(const pancy::request& req) {
+    auto it = std::remove_if(pending_reqs_.begin(), pending_reqs_.end(),
+        [&](const pancy::request& x) { return equal_request(x, req); });
+    pending_reqs_.erase(it, pending_reqs_.end());
 }
 
 // -----------------------------------------------------------------------------
@@ -430,12 +464,12 @@ void pt_paxos_replica::truncate_prefix(uint64_t new_start) {
     log_start_ += drop;
 
     // also discard init vals before truncation point
-    uint64_t iv_drop_to = std::min<uint64_t>(new_start, iv_base_ + IVs_.size());
-    if (iv_drop_to > iv_base_) {
-        uint64_t iv_drop = iv_drop_to - iv_base_;
-        IVs_.erase(IVs_.begin(), IVs_.begin() + iv_drop);
-        iv_base_ = iv_drop_to;
-    }
+//    uint64_t iv_drop_to = std::min<uint64_t>(new_start, iv_base_ + IVs_.size());
+//    if (iv_drop_to > iv_base_) {
+//        uint64_t iv_drop = iv_drop_to - iv_base_;
+//        IVs_.erase(IVs_.begin(), IVs_.begin() + iv_drop);
+//        iv_base_ = iv_drop_to;
+//    }
 }
 
 void pt_paxos_replica::local_truncate(uint64_t trim_to) {
@@ -453,13 +487,19 @@ cot::task<> pt_paxos_replica::apply_decisions_up_to(uint64_t limit) {
         const pancy::request& req = AVs_[decided_len_ - log_start_];
         pancy::response resp = db_.process_req(req);
     
-        // DEDUP: Cache committed resp
         uint64_t serial = request_serial_key(req);
         committed_response_by_serial_[serial] = resp;
+        erase_pending_request(req);
 
-        // only the current leader_index_ responds to clients
-        if (index_ == leader_index_) { co_await to_clients_.send(resp); }
-
+        auto it = waiting_client_reqs_.find(serial);
+        if (it != waiting_client_reqs_.end()) {
+            co_await to_clients_.send(resp);
+            waiting_client_reqs_.erase(it);
+        }    
+//        if (index_ == leader_index_) {
+//            co_await to_clients_.send(resp);
+//        }
+    
         ++decided_len_;
     }
 }
@@ -518,7 +558,7 @@ cot::task<> pt_paxos_replica::send_extension_propose() {
     // extend the current proposal in the same round by appending more IVs.
     if (!leader_.active || current_round_usurped()) { co_return; }
 
-    std::vector<pancy::request> next = extend_with_initial_values(leader_.proposed_base, leader_.proposed_AV, iv_base_, IVs_);
+    std::vector<pancy::request> next = append_pending_requests(leader_.proposed_AV, pending_reqs_); 
     if (next.size() <= leader_.proposed_AV.size()) { co_return; }
 
     leader_.proposed_AV = next;
@@ -572,20 +612,33 @@ pt_paxos_replica::best_prepare(const std::map<size_t, leader_round_state::prepar
 // -----------------------------------------------------------------------------
 
 cot::task<> pt_paxos_replica::handle_timeout() {
-    // LEADER: retransmit PROPOSE / DECIDE / maybe PROBE
-    // NON-LEADER: start new PROBE round
     if (index_ == leader_index_ && leader_.active && !current_round_usurped()) {
-        if (!leader_.proposed_AV.empty()) {
+        bool someone_behind = false;
+        for (const auto& [server, applied] : leader_.applied_q) {
+            if (applied < leader_.decided_w) {
+                someone_behind = true;
+                break;
+            }
+        }
+        if (leader_.applied_q.size() < nreplicas_) {
+            someone_behind = true;
+        }
+
+        uint64_t proposed_end = leader_proposed_abs_len();
+        bool have_undecided_suffix = proposed_end > leader_.decided_w;
+
+        if (!leader_.proposed_AV.empty() && (have_undecided_suffix || someone_behind)) {
             co_await broadcast(mp_propose{index_, leader_.r, leader_.proposed_base, leader_.proposed_AV});
         }
-        if (leader_.decided_w > 0 || leader_.trim_w > 0) {
+
+        if ((leader_.decided_w > 0 || leader_.trim_w > 0) && someone_behind) {
             co_await broadcast(mp_decide{index_, leader_.r, leader_.decided_w, leader_.trim_w});
         }
-        if (leader_.prepare_q.size() < quorum_size_) {  
+
+        if (leader_.prepare_q.size() < quorum_size_) {
             co_await broadcast(mp_probe{index_, leader_.r, decided_len_});
         }
-    } 
-    else if (cot::now() - last_leader_msg_ > LEADER_TIMEOUT_) {
+    } else if (cot::now() - last_leader_msg_ > LEADER_TIMEOUT_) {
         co_await probe();
     }
 }
@@ -609,8 +662,13 @@ cot::task<> pt_paxos_replica::handle_client_request(const pancy::request& req) {
         co_return;
     }
 
-    IVs_.push_back(req);
-    ++consensus_inserts_;
+    waiting_client_reqs_[serial] = req;
+
+//    IVs_.push_back(req);
+    if (!contains_request(pending_reqs_, req)) {
+        pending_reqs_.push_back(req);
+        ++consensus_inserts_;
+    }
     check_invariants();
 
     // if think leader and no active round, start
@@ -624,7 +682,7 @@ cot::task<> pt_paxos_replica::handle_client_request(const pancy::request& req) {
             auto [best_ar, best_base, best_AV] = best_prepare(leader_.prepare_q);
             (void) best_ar;
             leader_.proposed_base = best_base;
-            leader_.proposed_AV = extend_with_initial_values(best_base, best_AV, iv_base_, IVs_);
+            leader_.proposed_AV = append_pending_requests(best_AV, pending_reqs_);
             check_invariants();
             co_await broadcast(mp_propose{index_, leader_.r, leader_.proposed_base, leader_.proposed_AV});
         } 
@@ -669,7 +727,7 @@ cot::task<> pt_paxos_replica::handle_prepare(const mp_prepare& m) {
     (void) best_ar;
 
     // extend w/leader's pending client reqs
-    std::vector<pancy::request> V = extend_with_initial_values(best_base, best_AV, iv_base_, IVs_);
+    std::vector<pancy::request> V = append_pending_requests(best_AV, pending_reqs_);
 
     if (leader_.proposed_AV.empty()) {
         // first proposal in this round
@@ -751,7 +809,7 @@ cot::task<> pt_paxos_replica::handle_ack(const mp_ack& m) {
 
 cot::task<> pt_paxos_replica::handle_decide(const mp_decide& m) {
     // Receive DECIDE(r, w)
-    if (m.r < ars_) { co_return; }
+    if (m.r != ars_) { co_return; }
 
     uint64_t wprime = std::min<uint64_t>(m.w, av_abs_len());
     if (wprime > decided_len_) {
@@ -839,6 +897,28 @@ cot::task<> fail_then_recover(pt_paxos_instance& inst, size_t i,
     }
 }
 
+cot::task<> split_brain_after(pt_paxos_instance& inst, size_t isolated,
+        cot::duration start_at, cot::duration end_at, double original_loss) {
+    co_await cot::after(start_at);
+
+    for (size_t j = 0; j < inst.replicas.size(); ++j) {
+        if (j == isolated) { continue; }
+
+        inst.replicas[isolated]->to_replicas_[j]->set_loss(1.0);
+
+        inst.replicas[j]->to_replicas_[isolated]->set_loss(1.0);
+    }
+
+    co_await cot::after(end_at - start_at);
+
+    for (size_t j = 0; j < inst.replicas.size(); ++j) {
+        if (j == isolated) { continue; }
+
+        inst.replicas[isolated]->to_replicas_[j]->set_loss(original_loss);
+        inst.replicas[j]->to_replicas_[isolated]->set_loss(original_loss);
+    }
+}
+
 bool try_one_seed(testinfo& tester, unsigned long seed) {
     cot::reset();   // clear old events and coroutines
     tester.randomness.seed(seed);
@@ -854,7 +934,7 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
         tasks.push_back(inst.replicas[s]->run());
     }
 
-    tasks.push_back(fail_then_recover(inst, 0, 30s, 60s, tester.loss));
+    tasks.push_back(fail_then_recover(inst, 0, 5s, 15s, tester.loss));
     cot::task<> timeout_task = clear_after(100s);
 
     // Wait for `timeout_task`
